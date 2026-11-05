@@ -1,0 +1,1923 @@
+// Adapted from STEM 6899b3c2b056d2a6b82a9d37f6168ac78ee709c1 (MIT; vendor/stem/LICENSE).
+// stem v2 — pure-Krypton terminal on objk, term.k grid render. No Obj-C source.
+import "k:okui"
+import "catalog.k"
+import "workbench.k"
+import "../tests/selftest.k"
+import "k:cocoa"
+import "k:objc"
+import "head:cocoa"
+import "head:objc"
+
+// term.k — stem grid driver (pure Krypton terminal core, phase 4).
+//
+// Maintains a rows×cols cell grid with a cursor and ACTS on the common VT
+// sequences — cursor positioning (CUP/CUU/CUD/CUF/CUB), erase (ED/EL), CR/LF/
+// BS/TAB, SGR fg+bg colour, scroll-on-overflow — then renders the grid back to
+// text (re-emitting ANSI colour). Krypton port of brain/terk's Grid + applyEscape.
+//
+// Two representations of state:
+//   - one-shot:    renderGrid(s, cols, rows)            -> text
+//   - incremental: gridNew(cols,rows) -> state          (a packed string)
+//                  gridFeed(state, bytes, cols, rows)   -> state
+//                  gridRender(state, cols, rows)        -> text
+// The interactive loop keeps `state` across frames and feeds only the new bytes,
+// so it never re-processes the whole stream (renderGrid is O(input×gridsize)).
+//
+// The CHARACTER grid uses 5-byte slots per cell: [width][b0][b1][b2][b3], width
+// 1-4 = how many following bytes are the cell's UTF-8 character (rest SOH-padded)
+// — so a multi-byte glyph occupies one display column. `attr` (fg) and `battr`
+// (bg) grids are 1 byte/cell (SGR colour code, sentinel 1 = default). The packed
+// state string is grid+attr+battr+"|"+cr+","+cc+","+pen. Every byte is non-NUL
+// (widths 1-4, SOH pad, colour codes >=30, UTF-8 >=0x20, header is ASCII). Uses
+// only charCode/substring/len/sbAppend/fromCharCode — verified native builtins
+// (k:map is broken on macho). No C, no FFI, no maps.
+
+
+// _isLetter(code) — CSI final byte is an ASCII letter.
+func _isLetter(c) {
+    emit (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+// _leadInt(s, def) — leading non-negative integer in s; `def` if none.
+func _leadInt(s, def) {
+    let n = len(s)
+    let i = 0
+    let v = 0
+    let any = 0
+    while i < n {
+        let c = charCode(substring(s, i, i + 1))
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48)  any = 1  i = i + 1 }
+        else { i = n }
+    }
+    if any == 0 { emit def }
+    emit v
+}
+
+// _afterSemi(s) — substring after the first ';' (empty if none). For ESC[r;cH.
+func _afterSemi(s) {
+    let n = len(s)
+    let i = 0
+    while i < n {
+        if charCode(substring(s, i, i + 1)) == 59 { emit substring(s, i + 1, n) }
+        i = i + 1
+    }
+    emit ""
+}
+
+// _clamp(v, lo, hi)
+func _clamp(v, lo, hi) {
+    if v < lo { emit lo }
+    if v > hi { emit hi }
+    emit v
+}
+
+// _cf(s, k) — the k-th comma-separated non-negative integer field of s (0 if none).
+func _cf(s, k) {
+    let n = len(s)
+    let i = 0
+    let field = 0
+    let v = 0
+    while i < n {
+        let c = charCode(substring(s, i, i + 1))
+        if c == 44 { if field == k { emit v }  field = field + 1  v = 0 }
+        else { if c >= 48 && c <= 57 { v = v * 10 + (c - 48) } }
+        i = i + 1
+    }
+    if field == k { emit v }
+    emit 0
+}
+
+// _fill1(size) — a string of `size` SOH bytes (the default-colour sentinel).
+func _fill1(size) {
+    let sb = sbNew()
+    let one = fromCharCode(1)
+    let i = 0
+    while i < size { sb = sbAppend(sb, one)  i = i + 1 }
+    emit sbToString(sb)
+}
+
+// _cellBlank() — one blank char-grid slot: width 1, a space, 3 SOH pad bytes.
+func _cellBlank() {
+    emit fromCharCode(1) + " " + fromCharCode(1) + fromCharCode(1) + fromCharCode(1)
+}
+
+// _blankRow(cols) — `cols` blank char-grid slots (cols*5 bytes).
+func _blankRow(cols) {
+    let sb = sbNew()
+    let b = _cellBlank()
+    let i = 0
+    while i < cols { sb = sbAppend(sb, b)  i = i + 1 }
+    emit sbToString(sb)
+}
+
+// _putCell(g, cellIdx, chstr) — store the (1-4 byte) UTF-8 char in slot cellIdx.
+func _putCell(g, cellIdx, chstr) {
+    let w = len(chstr)
+    let pad = ""
+    let k = w
+    while k < 4 { pad = pad + fromCharCode(1)  k = k + 1 }
+    let off = cellIdx * 5
+    emit substring(g, 0, off) + fromCharCode(w) + chstr + pad + substring(g, off + 5, len(g))
+}
+
+// _put1(g, idx, ch) — replace the 1-byte cell at idx (attr/battr grids).
+func _put1(g, idx, ch) {
+    emit substring(g, 0, idx) + ch + substring(g, idx + 1, len(g))
+}
+
+// _scrollUp(g, stride, gtotal, fillRow) — drop the top row, append a fresh
+// bottom row (generic over byte-stride: char grid = cols*5, attr = cols).
+func _scrollUp(g, stride, gtotal, fillRow) {
+    emit substring(g, stride, gtotal) + fillRow
+}
+
+// _applySgr(pen, params) — fold an SGR list (e.g. "1;31;44") into the colour pen
+// (fg*256+bg, sentinel 1 each): fg 30-37/39/90-97, bg 40-47/49/100-107.
+// _lvl(v) — an 8-bit channel -> nearest xterm-256 cube level (0-5).
+func _lvl(v) {
+    if v < 48 { emit 0 }
+    if v < 115 { emit 1 }
+    if v < 155 { emit 2 }
+    if v < 195 { emit 3 }
+    if v < 235 { emit 4 }
+    emit 5
+}
+// _rgb256(r,g,b) — nearest xterm-256 colour-cube index (16-231). Truecolor
+// (38;2/48;2) is folded to 256 so it fits the 1-byte-per-cell colour model.
+func _rgb256(r, g, b) {
+    emit 16 + 36 * _lvl(r) + 6 * _lvl(g) + _lvl(b)
+}
+
+func _applySgr(pen, params) {
+    let n = len(params)
+    if n == 0 { emit 257 }
+    let fg = pen / 256
+    let bg = pen - fg * 256
+    let i = 0
+    let cur = 0
+    let any = 0
+    // fg/bg encoded as a 256-colour index: 1 = default, 2..255 = index 0..253.
+    // stage drives the 38;5;N / 48;5;N (256) and 38;2;r;g;b / 48;2;r;g;b (true-
+    // colour) sub-sequences. tr/tg hold r,g while collecting a truecolor triple.
+    let stage = 0    // 0 norm; 1 got38; 2 got38;5; 3 got48; 4 got48;5;
+                     // 5/6/7 = 38;2 r/g/b ; 8/9/10 = 48;2 r/g/b
+    let tr = 0
+    let tg = 0
+    while i <= n {
+        let sep = 0
+        if i == n { sep = 1 }
+        else { if charCode(substring(params, i, i + 1)) == 59 { sep = 1 } }
+        if sep == 1 {
+            if any == 1 {
+                if stage == 2 { let x = cur  if x > 253 { x = 253 }  fg = x + 2  stage = 0 }
+                else { if stage == 4 { let x = cur  if x > 253 { x = 253 }  bg = x + 2  stage = 0 }
+                else { if stage == 5 { tr = cur  stage = 6 }
+                else { if stage == 6 { tg = cur  stage = 7 }
+                else { if stage == 7 { let x = _rgb256(tr, tg, cur)  if x > 253 { x = 253 }  fg = x + 2  stage = 0 }
+                else { if stage == 8 { tr = cur  stage = 9 }
+                else { if stage == 9 { tg = cur  stage = 10 }
+                else { if stage == 10 { let x = _rgb256(tr, tg, cur)  if x > 253 { x = 253 }  bg = x + 2  stage = 0 }
+                else { if stage == 1 { if cur == 5 { stage = 2 } else { if cur == 2 { stage = 5 } else { stage = 0 } } }
+                else { if stage == 3 { if cur == 5 { stage = 4 } else { if cur == 2 { stage = 8 } else { stage = 0 } } }
+                else {
+                    if cur == 0 { fg = 1  bg = 1 }
+                    if cur == 38 { stage = 1 }
+                    if cur == 48 { stage = 3 }
+                    if cur == 39 { fg = 1 }
+                    if cur >= 30 && cur <= 37 { fg = cur - 28 }      // index 0-7
+                    if cur >= 90 && cur <= 97 { fg = cur - 80 }      // index 8-15
+                    if cur == 49 { bg = 1 }
+                    if cur >= 40 && cur <= 47 { bg = cur - 38 }      // index 0-7
+                    if cur >= 100 && cur <= 107 { bg = cur - 90 }    // index 8-15
+                } } } } } } } } } }
+            }
+            cur = 0
+            any = 0
+        } else {
+            let c = charCode(substring(params, i, i + 1))
+            if c >= 48 && c <= 57 { cur = cur * 10 + (c - 48)  any = 1 }
+        }
+        i = i + 1
+    }
+    emit fg * 256 + bg
+}
+
+// _sgrPair(fg, bg) — ANSI to set (fg,bg); 1 = default, else 256-colour index+2.
+// Re-emitted as 256-colour so the shim renders the exact palette. Reset-then-set.
+func _sgrPair(fg, bg) {
+    let e = fromCharCode(27)
+    let s = e + "[0m"
+    if fg != 1 { s = s + e + "[38;5;" + (fg - 2) + "m" }
+    if bg != 1 { s = s + e + "[48;5;" + (bg - 2) + "m" }
+    emit s
+}
+
+// _utf8Len(c) — byte length of a UTF-8 char from its lead byte (1 if invalid).
+func _utf8Len(c) {
+    if c >= 240 && c <= 247 { emit 4 }
+    if c >= 224 && c <= 239 { emit 3 }
+    if c >= 192 && c <= 223 { emit 2 }
+    emit 1
+}
+
+// gridNew(cols, rows) — a fresh blank packed grid state.
+func gridNew(cols, rows) {
+    let total = cols * rows
+    let grid = _blankRow(cols)
+    let rr = 1
+    while rr < rows { grid = grid + _blankRow(cols)  rr = rr + 1 }
+    emit grid + _fill1(total) + _fill1(total) + "|0,0,257,0,0,257,0,0,0,0,0,0,0,1,0,0,0" + fromCharCode(1) + fromCharCode(1)
+}
+
+// gridFeed(state, s, cols, rows) — process byte string s against the packed
+// state (cursor/erase/colour/scroll), return the new packed state.
+func gridFeed(state, s, cols, rows) {
+    let total = cols * rows
+    let g5 = 5 * total
+    let gtotal = g5
+    let stride = cols * 5
+    let grid = substring(state, 0, g5)
+    let attr = substring(state, g5, g5 + total)
+    let battr = substring(state, g5 + total, g5 + 2 * total)
+    let tailFull = substring(state, g5 + 2 * total + 1, len(state))
+    let sohp = indexOf(tailFull, fromCharCode(1))
+    let tail = substring(tailFull, 0, sohp)
+    let afterSoh = substring(tailFull, sohp + 1, len(tailFull))   // scrolled <SOH> savedGrids
+    let soh2 = indexOf(afterSoh, fromCharCode(1))
+    let savedGrids = ""                  // saved MAIN planes while the alt screen is active
+    if soh2 >= 0 { savedGrids = substring(afterSoh, soh2 + 1, len(afterSoh)) }
+    let cr = _cf(tail, 0)
+    let cc = _cf(tail, 1)
+    let pen = _cf(tail, 2)
+    let scr = _cf(tail, 3)               // saved cursor row (ESC7/ESC8)
+    let scc = _cf(tail, 4)               // saved cursor col
+    let spen = _cf(tail, 5)              // saved colour pen
+    let pw = _cf(tail, 6)                // pending wrap (deferred auto-margin)
+    let mlevel = _cf(tail, 8)            // mouse tracking: 0 off, 1 click, 2 drag, 3 any-motion
+    let msgr = _cf(tail, 9)              // mouse SGR(1006) encoding on/off (persist)
+    let altActive = _cf(tail, 10)        // alt screen (1049/1047/47) currently active
+    let savedAltCr = _cf(tail, 11)       // main cursor saved on alt-enter
+    let savedAltCc = _cf(tail, 12)
+    let cvis = _cf(tail, 13)             // cursor visible (DECSET 25); 0 = hidden
+    let cshape = _cf(tail, 14)           // app cursor shape (DECSCUSR): 0 config, 1 bar, 2 block, 3 underline
+    let pasteMode = _cf(tail, 15)        // bracketed paste enabled (DECSET 2004)
+    let focusMode = _cf(tail, 16)        // focus reporting enabled (DECSET 1004)
+    let scrolled = ""                    // rows scrolled off THIS feed (reset each call)
+    let bell = 0                         // bare BEL (0x07) seen THIS feed (reset each call)
+    let n = len(s)
+    let i = 0
+
+    while i < n {
+        let c = charCode(substring(s, i, i + 1))
+
+        if c == 27 {                                   // ESC
+            if i + 1 >= n { i = n }
+            else {
+                let k = charCode(substring(s, i + 1, i + 2))
+                if k == 91 {                           // '[' → CSI
+                    let j = i + 2
+                    while j < n && _isLetter(charCode(substring(s, j, j + 1))) == 0 { j = j + 1 }
+                    if j >= n { i = n }
+                    else {
+                        let fin = charCode(substring(s, j, j + 1))
+                        let params = substring(s, i + 2, j)
+                        let p0 = _leadInt(params, 1)
+                        if fin >= 65 && fin <= 72 { pw = 0 }    // any cursor move/CUP clears pending wrap
+                        if fin == 72 || fin == 102 {     // 'H'/'f' CUP row;col (1-based)
+                            cr = _clamp(p0 - 1, 0, rows - 1)
+                            cc = _clamp(_leadInt(_afterSemi(params), 1) - 1, 0, cols - 1)
+                        }
+                        if fin == 65 { cr = _clamp(cr - p0, 0, rows - 1) }   // up
+                        if fin == 66 { cr = _clamp(cr + p0, 0, rows - 1) }   // down
+                        if fin == 67 { cc = _clamp(cc + p0, 0, cols - 1) }   // forward
+                        if fin == 68 { cc = _clamp(cc - p0, 0, cols - 1) }   // back
+                        if fin == 109 { pen = _applySgr(pen, params) }       // 'm' SGR colour
+                        if fin == 115 { scr = cr  scc = cc  spen = pen }     // 's' save cursor
+                        if fin == 117 { cr = scr  cc = scc  pen = spen }     // 'u' restore cursor
+                        if fin == 113 {                  // 'q' DECSCUSR — app cursor shape
+                            let ps = _leadInt(params, 0)
+                            if ps == 0 { cshape = 0 }                  // reset -> config default
+                            if ps == 1 || ps == 2 { cshape = 2 }       // block
+                            if ps == 3 || ps == 4 { cshape = 3 }       // underline
+                            if ps == 5 || ps == 6 { cshape = 1 }       // bar
+                        }
+                        if fin == 74 {                   // 'J' erase in display (honour param)
+                            let pj = _leadInt(params, 0)
+                            let ja = 0
+                            let jb = total
+                            if pj == 0 { ja = cr * cols + cc }       // cursor → end of screen
+                            if pj == 1 { jb = cr * cols + cc + 1 }    // start → cursor
+                            // pj >= 2: whole screen
+                            let jcnt = jb - ja
+                            grid = substring(grid, 0, ja * 5) + _blankRow(jcnt) + substring(grid, ja * 5 + jcnt * 5, gtotal)
+                            attr = substring(attr, 0, ja) + _fill1(jcnt) + substring(attr, ja + jcnt, total)
+                            battr = substring(battr, 0, ja) + _fill1(jcnt) + substring(battr, ja + jcnt, total)
+                            if pj >= 2 { cr = 0  cc = 0 }            // clear-all homes (matches kryofetch)
+                        }
+                        if fin == 75 {                   // 'K' erase in line (honour param)
+                            let pk = _leadInt(params, 0)
+                            let a = 0
+                            let b = cols
+                            if pk == 0 { a = cc }                    // cursor → end
+                            if pk == 1 { b = cc + 1 }                // start → cursor
+                            // pk == 2 (or other): whole line (a=0, b=cols)
+                            let cnt = b - a
+                            let o5 = (cr * cols + a) * 5
+                            grid = substring(grid, 0, o5) + _blankRow(cnt) + substring(grid, o5 + cnt * 5, gtotal)
+                            let o1 = cr * cols + a
+                            attr = substring(attr, 0, o1) + _fill1(cnt) + substring(attr, o1 + cnt, total)
+                            battr = substring(battr, 0, o1) + _fill1(cnt) + substring(battr, o1 + cnt, total)
+                        }
+                        if fin == 104 || fin == 108 {    // 'h' DECSET / 'l' DECRST (private '?' modes)
+                            if len(params) > 0 && charCode(substring(params, 0, 1)) == 63 {
+                                let mode = _leadInt(substring(params, 1, len(params)), 0)
+                                let on = 0
+                                if fin == 104 { on = 1 }
+                                if mode == 1000 { if on == 1 { mlevel = 1 } else { mlevel = 0 } }  // click
+                                if mode == 1002 { if on == 1 { mlevel = 2 } else { mlevel = 0 } }  // button-drag
+                                if mode == 1003 { if on == 1 { mlevel = 3 } else { mlevel = 0 } }  // any-motion
+                                if mode == 1006 { msgr = on }                                      // SGR encoding
+                                if mode == 25 { cvis = on }                                        // cursor show/hide
+                                if mode == 2004 { pasteMode = on }                                 // bracketed paste
+                                if mode == 1004 { focusMode = on }                                 // focus reporting
+                                if mode == 1049 || mode == 1047 || mode == 47 {                    // alt screen
+                                    if on == 1 {
+                                        if altActive == 0 {
+                                            savedGrids = grid + attr + battr     // save the main planes
+                                            savedAltCr = cr  savedAltCc = cc
+                                            grid = _blankRow(total)  attr = _fill1(total)  battr = _fill1(total)
+                                            cr = 0  cc = 0  pw = 0
+                                            altActive = 1
+                                        }
+                                    } else {
+                                        if altActive == 1 {
+                                            grid = substring(savedGrids, 0, g5)             // restore main
+                                            attr = substring(savedGrids, g5, g5 + total)
+                                            battr = substring(savedGrids, g5 + total, g5 + 2 * total)
+                                            cr = savedAltCr  cc = savedAltCc  pw = 0
+                                            savedGrids = ""
+                                            altActive = 0
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        i = j + 1
+                    }
+                } else {
+                    if k == 93 {                         // ']' → OSC: skip to BEL/ST
+                        let j = i + 2
+                        let done = 0
+                        while j < n && done == 0 {
+                            let cj = charCode(substring(s, j, j + 1))
+                            if cj == 7 { done = 1  i = j + 1 }
+                            else {
+                                if cj == 27 && j + 1 < n && charCode(substring(s, j + 1, j + 2)) == 92 { done = 1  i = j + 2 }
+                                else { j = j + 1 }
+                            }
+                        }
+                        if done == 0 { i = n }
+                    } else {
+                        if k == 55 { scr = cr  scc = cc  spen = pen }    // ESC 7 save cursor
+                        if k == 56 { cr = scr  cc = scc  pen = spen }    // ESC 8 restore cursor
+                        i = i + 2                        // ESC x (2-byte)
+                    }
+                }
+            }
+        } else {
+            if c == 10 {                                                         // LF → newline
+                cr = cr + 1  cc = 0  pw = 0
+                if cr >= rows {
+                    if altActive == 0 { scrolled = scrolled + _renderRow(grid, attr, battr, 0, cols) + fromCharCode(10) }
+                    grid = _scrollUp(grid, stride, gtotal, _blankRow(cols))
+                    attr = _scrollUp(attr, cols, total, _fill1(cols))
+                    battr = _scrollUp(battr, cols, total, _fill1(cols))
+                    cr = rows - 1
+                }
+                i = i + 1
+            }
+            else {
+                if c == 13 { cc = 0  pw = 0  i = i + 1 }                         // CR
+                else {
+                    if c == 8 { if cc > 0 { cc = cc - 1 }  pw = 0  i = i + 1 }   // BS
+                    else {
+                        if c == 9 {                                              // TAB
+                            cc = ((cc / 8) + 1) * 8
+                            if cc >= cols { cc = cols - 1 }
+                            i = i + 1
+                        } else {
+                            if c >= 32 {                                         // printable (incl UTF-8)
+                                let clen = _utf8Len(c)
+                                if i + clen > n { clen = n - i }
+                                if pw == 1 {                                     // deferred wrap from last col
+                                    cc = 0  cr = cr + 1  pw = 0
+                                    if cr >= rows {
+                                        if altActive == 0 { scrolled = scrolled + _renderRow(grid, attr, battr, 0, cols) + fromCharCode(10) }
+                                        grid = _scrollUp(grid, stride, gtotal, _blankRow(cols))
+                                        attr = _scrollUp(attr, cols, total, _fill1(cols))
+                                        battr = _scrollUp(battr, cols, total, _fill1(cols))
+                                        cr = rows - 1
+                                    }
+                                }
+                                let idx = cr * cols + cc
+                                let pfg = pen / 256
+                                grid = _putCell(grid, idx, substring(s, i, i + clen))
+                                attr = _put1(attr, idx, fromCharCode(pfg))
+                                battr = _put1(battr, idx, fromCharCode(pen - pfg * 256))
+                                if cc >= cols - 1 { pw = 1 }                     // at last column -> defer wrap
+                                else { cc = cc + 1 }
+                                i = i + clen
+                            } else { if c == 7 { bell = 1 }  i = i + 1 }          // BEL (bell) / other control byte
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    emit grid + attr + battr + "|" + cr + "," + cc + "," + pen + "," + scr + "," + scc + "," + spen + "," + pw + "," + bell + "," + mlevel + "," + msgr + "," + altActive + "," + savedAltCr + "," + savedAltCc + "," + cvis + "," + cshape + "," + pasteMode + "," + focusMode + fromCharCode(1) + scrolled + fromCharCode(1) + savedGrids
+}
+
+// _renderRow(grid, attr, battr, base, cols) — one cell-row (base = row*cols)
+// rendered to text: trailing blanks trimmed, fg+bg re-emitted, no trailing \n.
+func _renderRow(grid, attr, battr, base, cols) {
+    let e = cols
+    let trimming = 1
+    while e > 0 && trimming == 1 {
+        let off = (base + e - 1) * 5
+        let w = charCode(substring(grid, off, off + 1))
+        if w == 1 && substring(grid, off + 1, off + 2) == " " { e = e - 1 }
+        else { trimming = 0 }
+    }
+    let out = sbNew()
+    let lastFg = 1
+    let lastBg = 1
+    let col = 0
+    while col < e {
+        let cellFg = charCode(substring(attr, base + col, base + col + 1))
+        let cellBg = charCode(substring(battr, base + col, base + col + 1))
+        if cellFg != lastFg || cellBg != lastBg {
+            out = sbAppend(out, _sgrPair(cellFg, cellBg))
+            lastFg = cellFg
+            lastBg = cellBg
+        }
+        let off = (base + col) * 5
+        let w = charCode(substring(grid, off, off + 1))
+        out = sbAppend(out, substring(grid, off + 1, off + 1 + w))
+        col = col + 1
+    }
+    if lastFg != 1 || lastBg != 1 { out = sbAppend(out, fromCharCode(27) + "[0m") }
+    emit sbToString(out)
+}
+
+// gridRender(state, cols, rows) — render the packed state to text (rows joined
+// by \n, trailing blanks trimmed, fg+bg colour re-emitted as ANSI).
+func gridRender(state, cols, rows) {
+    let total = cols * rows
+    let g5 = 5 * total
+    let grid = substring(state, 0, g5)
+    let attr = substring(state, g5, g5 + total)
+    let battr = substring(state, g5 + total, g5 + 2 * total)
+    let out = sbNew()
+    let r = 0
+    while r < rows {
+        out = sbAppend(out, _renderRow(grid, attr, battr, r * cols, cols))
+        if r < rows - 1 { out = sbAppend(out, fromCharCode(10)) }
+        r = r + 1
+    }
+    emit sbToString(out)
+}
+
+// gridSafeLen(s) — length of the prefix of s safe to feed: excludes a trailing
+// INCOMPLETE escape sequence or UTF-8 char. The interactive bridge reads the pty
+// in arbitrary chunks that can split a sequence mid-way; feeding the partial
+// would corrupt the grid. The caller feeds s[0..gridSafeLen(s)] and carries the
+// rest over to prepend to the next chunk.
+func gridSafeLen(s) {
+    let n = len(s)
+    if n == 0 { emit 0 }
+
+    // (1) trailing partial escape: find the last ESC; cut there if incomplete.
+    let escCut = n
+    let p = n - 1
+    let lastEsc = 0 - 1
+    while p >= 0 {
+        if charCode(substring(s, p, p + 1)) == 27 { lastEsc = p  p = 0 - 1 }
+        else { p = p - 1 }
+    }
+    if lastEsc >= 0 {
+        let q = lastEsc + 1
+        if q >= n { escCut = lastEsc }                  // lone trailing ESC
+        else {
+            let k = charCode(substring(s, q, q + 1))
+            if k == 91 {                                // CSI: needs a final letter
+                let j = q + 1
+                let done = 0
+                while j < n {
+                    if _isLetter(charCode(substring(s, j, j + 1))) == 1 { done = 1  j = n }
+                    else { j = j + 1 }
+                }
+                if done == 0 { escCut = lastEsc }
+            }
+            if k == 93 {                                // OSC: needs BEL
+                let j = q + 1
+                let done = 0
+                while j < n {
+                    if charCode(substring(s, j, j + 1)) == 7 { done = 1  j = n }
+                    else { j = j + 1 }
+                }
+                if done == 0 { escCut = lastEsc }
+            }
+        }
+    }
+
+    // (2) trailing partial UTF-8 char.
+    let utfCut = n
+    let last = charCode(substring(s, n - 1, n))
+    if last >= 192 { utfCut = n - 1 }                   // lead byte at end -> incomplete
+    else {
+        if last >= 128 {                                // continuation -> find the lead
+            let lpos = n - 1
+            while lpos > 0 && charCode(substring(s, lpos, lpos + 1)) >= 128 && charCode(substring(s, lpos, lpos + 1)) <= 191 { lpos = lpos - 1 }
+            let lead = charCode(substring(s, lpos, lpos + 1))
+            if lead >= 192 {
+                if lpos + _utf8Len(lead) > n { utfCut = lpos }
+            }
+        }
+    }
+
+    if escCut < utfCut { emit escCut }
+    emit utfCut
+}
+
+// oscTitle(s, old) — the window title from an OSC 0/2 (`ESC]0;…BEL` / `ESC]2;…`)
+// in s, else `old`. Used by the bridge to track the shell-set title.
+func oscTitle(s, old) {
+    let e = fromCharCode(27)
+    let m = indexOf(s, e + "]0;")
+    if m < 0 { m = indexOf(s, e + "]2;") }
+    if m < 0 { emit old }
+    let rest = substring(s, m + 4, len(s))   // after "ESC]N;"
+    let bel = indexOf(rest, fromCharCode(7))  // BEL terminator
+    let st = indexOf(rest, e + fromCharCode(92))   // or ST (ESC \)
+    let stop = bel
+    if stop < 0 { stop = st }
+    else { if st >= 0 && st < stop { stop = st } }
+    if stop < 0 { emit old }                  // incomplete -> keep old
+    emit substring(rest, 0, stop)
+}
+
+// gridCursor(state, cols, rows) — the cursor position as "row,col" (0-based).
+func gridCursor(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let tail = substring(tailFull, 0, indexOf(tailFull, fromCharCode(1)))
+    if _cf(tail, 13) == 0 { emit "9999,0" }      // cursor hidden (DECSET 25 off)
+    emit _cf(tail, 0) + "," + _cf(tail, 1)
+}
+
+// gridMouse(state, cols, rows) — "mlevel,msgr": the app's mouse tracking level
+// (0 off / 1 click / 2 drag / 3 any-motion) and SGR(1006) encoding flag.
+func gridMouse(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let sohp = indexOf(tailFull, fromCharCode(1))
+    let tail = substring(tailFull, 0, sohp)
+    emit _cf(tail, 8) + "," + _cf(tail, 9)
+}
+
+// gridShape(state, cols, rows) — app-requested cursor shape (DECSCUSR):
+// 0 = use config default, 1 = bar, 2 = block, 3 = underline.
+func gridShape(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let tail = substring(tailFull, 0, indexOf(tailFull, fromCharCode(1)))
+    emit _cf(tail, 14)
+}
+
+// gridPaste(state, cols, rows) — 1 if the app enabled bracketed paste (DECSET 2004).
+func gridPaste(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let tail = substring(tailFull, 0, indexOf(tailFull, fromCharCode(1)))
+    emit _cf(tail, 15)
+}
+
+// gridAlt(state, cols, rows) — 1 if the alternate screen is active.
+func gridAlt(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let tail = substring(tailFull, 0, indexOf(tailFull, fromCharCode(1)))
+    emit _cf(tail, 10)
+}
+
+// gridFocus(state, cols, rows) — 1 if the app enabled focus reporting (DECSET 1004).
+func gridFocus(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let tail = substring(tailFull, 0, indexOf(tailFull, fromCharCode(1)))
+    emit _cf(tail, 16)
+}
+
+// gridBell(state, cols, rows) — 1 if a bare BEL (0x07) arrived during the last
+// gridFeed, else 0. The bridge raises a one-shot bell from this.
+func gridBell(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let sohp = indexOf(tailFull, fromCharCode(1))
+    emit _cf(substring(tailFull, 0, sohp), 7)
+}
+
+// gridScrolled(state, cols, rows) — the rows that scrolled off the top during the
+// last gridFeed (rendered text, one per \n). Empty if nothing scrolled. The
+// bridge drains this into its scrollback history.
+func gridScrolled(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let sohp = indexOf(tailFull, fromCharCode(1))
+    let afterSoh = substring(tailFull, sohp + 1, len(tailFull))   // scrolled <SOH> savedGrids
+    let soh2 = indexOf(afterSoh, fromCharCode(1))
+    if soh2 >= 0 { emit substring(afterSoh, 0, soh2) }            // just the scrolled part
+    emit afterSoh
+}
+
+// _stripSgrLine(s) — drop ESC[…<final> sequences so a line is searchable plain text.
+func _stripSgrLine(s) {
+    let out = sbNew()
+    let i = 0
+    let n = len(s)
+    while i < n {
+        let c = charCode(substring(s, i, i + 1))
+        if c == 27 {
+            i = i + 1
+            if i < n && charCode(substring(s, i, i + 1)) == 91 { i = i + 1 }   // '['
+            let done = 0
+            while i < n && done == 0 {
+                let k = charCode(substring(s, i, i + 1))
+                i = i + 1
+                if k >= 64 && k <= 126 { done = 1 }                            // CSI final byte
+            }
+        } else {
+            out = sbAppend(out, substring(s, i, i + 1))
+            i = i + 1
+        }
+    }
+    emit sbToString(out)
+}
+
+// gridFind(scrollback, gridText, rows, query, matchIdx) — find the matchIdx-th
+// occurrence of query (counting from the most recent line up), wrapping. Returns
+// "scrollOff,matchRow,matchCol,matchLen" to bring it into view + highlight it, or
+// "-1,-1,-1,-1" if no match / empty query.
+func gridFind(scrollback, gridText, rows, query, matchIdx) {
+    if len(query) == 0 { emit "-1,-1,-1,-1,0,0" }
+    let combined = scrollback + gridText
+    let nLines = lineCount(combined)
+    let total = 0
+    let li = nLines - 1
+    while li >= 0 {
+        if indexOf(_stripSgrLine(getLine(combined, li)), query) >= 0 { total = total + 1 }
+        li = li - 1
+    }
+    if total == 0 { emit "-1,-1,-1,-1,0,0" }
+    let mi = matchIdx
+    while mi >= total { mi = mi - total }
+    while mi < 0 { mi = mi + total }
+    let seen = 0
+    let foundLine = 0 - 1
+    let foundCol = 0
+    li = nLines - 1
+    while li >= 0 && foundLine < 0 {
+        let pos = indexOf(_stripSgrLine(getLine(combined, li)), query)
+        if pos >= 0 {
+            if seen == mi { foundLine = li  foundCol = pos }
+            seen = seen + 1
+        }
+        li = li - 1
+    }
+    // Place the match ~1/3 down the view. NOTE: macho integer subtraction
+    // underflows unsigned, so a-b is only safe when a>b — guard every step.
+    let smax = 0
+    if nLines > rows { smax = nLines - rows }
+    let third = rows / 3
+    let viewStart = 0
+    if foundLine > third { viewStart = foundLine - third }
+    if viewStart > smax { viewStart = smax }
+    let scrollOff = 0
+    if smax > viewStart { scrollOff = smax - viewStart }
+    let matchRow = 0
+    if foundLine > viewStart { matchRow = foundLine - viewStart }
+    emit scrollOff + "," + matchRow + "," + foundCol + "," + len(query) + "," + (mi + 1) + "," + total
+}
+
+// gridScrollView(scrollback, gridText, rows, scrollOff) — `rows` lines of the
+// combined (scrollback ++ live grid) buffer, scrolled `scrollOff` lines up from
+// the bottom. scrollOff 0 = the live screen.
+func gridScrollView(scrollback, gridText, rows, scrollOff) {
+    let combined = scrollback + gridText
+    let nLines = lineCount(combined)
+    let start = nLines - rows - scrollOff
+    if start < 0 { start = 0 }
+    let out = sbNew()
+    let i = 0
+    while i < rows {
+        let li = start + i
+        if li >= 0 && li < nLines { out = sbAppend(out, getLine(combined, li)) }
+        if i < rows - 1 { out = sbAppend(out, fromCharCode(10)) }
+        i = i + 1
+    }
+    emit sbToString(out)
+}
+
+// renderGrid(s, cols, rows) — one-shot: feed s into a fresh grid, render to text.
+func renderGrid(s, cols, rows) {
+    emit gridRender(gridFeed(gridNew(cols, rows), s, cols, rows), cols, rows)
+}
+
+// ── objk GUI over the term.k grid ──────────────────────────────────────
+func appH() { emit msg(cls("NSApplication"), "sharedApplication") }
+func acceptsFR(self, cmd) { emit 1 }
+func isDarkMode(app) { emit indexOf(msg(msg(msg(app, "effectiveAppearance"), "name"), "UTF8String"), "Dark") >= 0 }
+func isCsiFinal(ch) { emit indexOf("@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~", ch) >= 0 }
+
+// Raw key -> pty (arrows -> ESC[ABCD).
+func onKey(self, cmd, event) {
+  let pf = cocoaGetAssocKey(self, "ptyfd")
+  let m = cocoaNumberVal(cocoaGetAssocKey(appH(), "stem.master"))
+  if pf != 0 { m = cocoaNumberVal(pf) }
+  cocoaSetAssocKey(appH(), "stem.focusidx", cocoaGetAssocKey(self, "paneidx"))
+  let esc = fromCharCode(27)
+  let kc = msg(event, "keyCode")
+  let seq = ""
+  if kc == 126 { seq = esc + "[A" }
+  if kc == 125 { seq = esc + "[B" }
+  if kc == 124 { seq = esc + "[C" }
+  if kc == 123 { seq = esc + "[D" }
+  if kc == 36 { seq = fromCharCode(13) }
+  if kc == 51 { seq = fromCharCode(127) }
+  if seq == "" { seq = msg(msg(event, "characters"), "UTF8String") }
+  if msg(event, "modifierFlags") / 262144 - (msg(event, "modifierFlags") / 524288) * 2 == 1 {
+    let raw = toLower(nsToStr(msg(event, "charactersIgnoringModifiers")))
+    if len(raw) == 1 { let code = charCode(raw) if code >= 97 && code <= 122 { seq = fromCharCode(code - 96) } }
+  }
+  fdWrite(m, seq, len(seq))
+}
+
+// xterm-256 cube channel level (0->0, 1..5 -> 95,135,175,215,255).
+func cubeLvl(v) { if v == 0 { emit 0 }  emit v * 40 + 55 }
+
+// True 256-colour index -> NSColor (exact RGB): 0-15 ANSI palette, 16-231 the
+// 6x6x6 cube, 232-255 greyscale ramp.
+// ── config (~/.config/stem/config, simple key = value) ─────────────────
+func cfgVal(cfg, key, def) {
+  let n = len(cfg)  let i = 0  let ls = 0
+  while i <= n {
+    let brk = 0
+    if i == n { brk = 1 }
+    if brk == 0 { if cfg[i] == "\n" { brk = 1 } }
+    if brk == 1 {
+      let line = trim(substring(cfg, ls, i))
+      let eq = indexOf(line, "=")
+      if eq > 0 { if trim(substring(line, 0, eq)) == key {
+        let value = trim(substring(line, eq + 1, len(line)))
+        let hash = indexOf(value, "#")
+        // A leading # is a colour value; later # characters begin comments.
+        if hash > 0 { value = trim(substring(value, 0, hash)) }
+        emit value
+      } }
+      ls = i + 1
+    }
+    i = i + 1
+  }
+  emit def
+}
+func cfgAlias(cfg, primary, legacy, def) {
+  let v = cfgVal(cfg, primary, "")
+  if v != "" { emit v }
+  emit cfgVal(cfg, legacy, def)
+}
+func cfgBool(cfg, key, def) {
+  let v = toLower(cfgVal(cfg, key, ""))
+  if v == "true" || v == "yes" || v == "on" || v == "1" { emit 1 }
+  if v == "false" || v == "no" || v == "off" || v == "0" { emit 0 }
+  emit def
+}
+func hexNib(c) { emit indexOf("0123456789abcdef", toLower(c)) }
+func hexByte(s, i) { emit hexNib(substring(s, i, i + 1)) * 16 + hexNib(substring(s, i + 1, i + 2)) }
+// config colour (#RRGGBB) or fallback RGB.
+func cfgRGB(cfg, key, r, g, b) {
+  let v = cfgVal(cfg, key, "")
+  if indexOf(v, "#") == 0 { emit cocoaRGB(hexByte(v, 1), hexByte(v, 3), hexByte(v, 5)) }
+  emit cocoaRGB(r, g, b)
+}
+func cfgRGBAlias(cfg, primary, legacy, r, g, b) {
+  let v = cfgVal(cfg, primary, "")
+  if v == "" { v = cfgVal(cfg, legacy, "") }
+  if indexOf(v, "#") == 0 { emit cocoaRGB(hexByte(v, 1), hexByte(v, 3), hexByte(v, 5)) }
+  emit cocoaRGB(r, g, b)
+}
+// palette lookup (built once into stem.pal; colours 0-15 overridable via config).
+func color256(n) { emit cocoaArrayGet(cocoaGetAssocKey(appH(), "stem.pal"), n) }
+
+func color256def(n) {
+  if n == 0  { emit cocoaRGB(0, 0, 0) }
+  if n == 1  { emit cocoaRGB(205, 49, 49) }
+  if n == 2  { emit cocoaRGB(13, 188, 121) }
+  if n == 3  { emit cocoaRGB(229, 229, 16) }
+  if n == 4  { emit cocoaRGB(36, 114, 200) }
+  if n == 5  { emit cocoaRGB(188, 63, 188) }
+  if n == 6  { emit cocoaRGB(17, 168, 205) }
+  if n == 7  { emit cocoaRGB(229, 229, 229) }
+  if n == 8  { emit cocoaRGB(102, 102, 102) }
+  if n == 9  { emit cocoaRGB(241, 76, 76) }
+  if n == 10 { emit cocoaRGB(35, 209, 139) }
+  if n == 11 { emit cocoaRGB(245, 245, 67) }
+  if n == 12 { emit cocoaRGB(59, 142, 234) }
+  if n == 13 { emit cocoaRGB(214, 112, 214) }
+  if n == 14 { emit cocoaRGB(41, 184, 219) }
+  if n == 15 { emit cocoaRGB(255, 255, 255) }
+  if n >= 232 { let g = (n - 232) * 10 + 8  emit cocoaRGB(g, g, g) }
+  let i = n - 16
+  emit cocoaRGB(cubeLvl((i / 36) % 6), cubeLvl((i / 6) % 6), cubeLvl(i % 6))
+}
+
+// One ESC[...m body -> new fg colour (0 reset; 38;5;N -> 256; bg/other kept).
+// 256 index from a "38;5;N" / "48;5;N" body (after the 5-char prefix).
+func sgrIndex(body) {
+  let rest = substring(body, 5, len(body))
+  let semi = indexOf(rest, ";")
+  if semi >= 0 { emit toInt(substring(rest, 0, semi)) }
+  emit toInt(rest)
+}
+
+func appendRunTo(acc, text, fg, bg, font) {
+  if len(text) == 0 { emit "1" }
+  let start = msg(acc, "length")
+  msg_1(acc, "appendAttributedString:", msg_1(msg(cls("NSAttributedString"), "alloc"), "initWithString:", nsString(text)))
+  let span = msg(acc, "length") - start
+  msg_4(acc, "addAttribute:value:range:", nsString("NSColor"), fg, start, span)
+  msg_4(acc, "addAttribute:value:range:", nsString("NSFont"), font, start, span)
+  let shadow = cocoaGetAssocKey(appH(), "stem.textshadow")
+  if shadow != 0 { msg_4(acc, "addAttribute:value:range:", nsString("NSShadow"), shadow, start, span) }
+  if bg != 0 { msg_4(acc, "addAttribute:value:range:", nsString("NSBackgroundColor"), bg, start, span) }
+  emit "1"
+}
+func stemCursorGlyph() {
+  let style = msg(cocoaGetAssocKey(appH(), "stem.cursorstyle"), "UTF8String")
+  if style == "block" { emit "█" }
+  if style == "underline" { emit "▂" }
+  emit "▏"
+}
+
+// Parse a gridRender snapshot (text + ESC[..m) -> a coloured NSMutableAttributedString.
+// Tracks fg (NSColor) + bg (NSBackgroundColor, 0 = none) so powerline segments fill.
+func renderSnapshot(snap, deflt, font, cr, cc, cursorOn) {
+  let acc = msg(msg(cls("NSMutableAttributedString"), "alloc"), "init")
+  let esc = fromCharCode(27)
+  let nl = fromCharCode(10)
+  let n = len(snap)
+  let i = 0
+  let run = ""
+  let fg = deflt
+  let bg = 0
+  let vrow = 0
+  let vcol = 0
+  let curStart = 0 - 1
+  while i < n {
+    let c = snap[i]
+    if c == esc {
+      if len(run) > 0 { appendRunTo(acc, run, fg, bg, font)  run = "" }
+      i = i + 1
+      if i < n {
+        if snap[i] == "[" {
+          i = i + 1
+          let body = ""
+          let done = 0
+          while done == 0 {
+            if i >= n { done = 1 }
+            if done == 0 {
+              let ch = snap[i]
+              i = i + 1
+              if isCsiFinal(ch) {
+                if ch == "m" {
+                  if body == "0" { fg = deflt  bg = 0 }
+                  if indexOf(body, "38;5;") == 0 { fg = color256(sgrIndex(body)) }
+                  if indexOf(body, "48;5;") == 0 { bg = color256(sgrIndex(body)) }
+                }
+                done = 1
+              }
+              if done == 0 { body = body + ch }
+            }
+          }
+        }
+      }
+    } else {
+      if c == nl {
+        // _renderRow trims trailing blank cells. When the cursor is in the
+        // first trimmed cell after a prompt, restore that cell before moving
+        // to the next rendered row; waiting until the end only works when the
+        // cursor happens to be on the terminal's final physical row.
+        if cursorOn == 1 { if curStart < 0 { if vrow == cr { if cc >= vcol {
+          if len(run) > 0 { appendRunTo(acc, run, fg, bg, font)  run = "" }
+          let pad = ""
+          let k = vcol
+          while k < cc { pad = pad + " "  k = k + 1 }
+          if len(pad) > 0 { appendRunTo(acc, pad, fg, bg, font) }
+          appendRunTo(acc, stemCursorGlyph(), cocoaGetAssocKey(appH(), "stem.cursorcolor"), bg, font)
+          curStart = 0
+        } } } }
+        run = run + c  vrow = vrow + 1  vcol = 0  i = i + 1
+      }
+      else {
+        let cont = 0
+        let code = charCode(c)
+        if code >= 128 { if code < 192 { cont = 1 } }
+        let isCur = 0
+        if cont == 0 { if vrow == cr { if vcol == cc { isCur = 1 } } }
+        if isCur == 1 && cursorOn == 1 {
+          if len(run) > 0 { appendRunTo(acc, run, fg, bg, font)  run = "" }
+          // bar cursor only over a blank cell; over a real char (e.g. an
+          // autosuggestion's first letter) keep the char so it stays visible.
+          // Always draw the configured cursor glyph. Keeping the underlying
+          // character made the cursor disappear over autosuggestions/text.
+          appendRunTo(acc, stemCursorGlyph(), cocoaGetAssocKey(appH(), "stem.cursorcolor"), bg, font)
+          curStart = 0
+        } else { run = run + c }
+        if cont == 0 { vcol = vcol + 1 }
+        i = i + 1
+      }
+    }
+  }
+  if len(run) > 0 { appendRunTo(acc, run, fg, bg, font)  run = "" }
+  // vertical bar cursor (ghostty-style). If not already drawn in-loop (curStart>=0),
+  // the cursor was at end-of-line and got trimmed out of gridRender — pad to its
+  // column on its row, draw the bar.
+  if cursorOn == 1 { if curStart < 0 {
+    if vrow == cr {
+      if cc >= vcol {
+      let pad = ""
+      let k = vcol
+      while k < cc { pad = pad + " "  k = k + 1 }
+      if len(pad) > 0 { appendRunTo(acc, pad, fg, bg, font) }
+      appendRunTo(acc, stemCursorGlyph(), cocoaGetAssocKey(appH(), "stem.cursorcolor"), bg, font)
+      }
+    }
+  } }
+  emit acc
+}
+
+func stemRepaintCursor(state, pane, cols, rows, fg, cursorOn) {
+  let app = appH()
+  let views = cocoaGetAssocKey(app, "stem.pviews")
+  let docs = cocoaGetAssocKey(app, "stem.pdocs")
+  let cp = gridCursor(state, cols, rows)
+  let comma = indexOf(cp, ",")
+  msg_1(cocoaArrayGet(views, pane), "setAttributedString:", renderSnapshot(gridRender(state, cols, rows), fg, cocoaGetAssocKey(app, "stem.mono"), toInt(substring(cp, 0, comma)), toInt(substring(cp, comma + 1, len(cp))), cursorOn))
+  msg_1(cocoaArrayGet(docs, pane), "setNeedsDisplay:", 1)
+  emit "1"
+}
+
+// ── menu handlers ───────────────────────────────────────────────────────
+func stemMaster() { emit cocoaNumberVal(cocoaGetAssocKey(appH(), "stem.master")) }
+func onStemNewWin(self, cmd, sender) { shellRun("/usr/bin/open -n " + shellQuote(nsToStr(msg(msg(cls("NSBundle"), "mainBundle"), "bundlePath"))))  emit "1" }
+func onStemClear(self, cmd, sender)  { fdWrite(stemMaster(), fromCharCode(12), 1)  emit "1" }
+func onStemPaste(self, cmd, sender)  { let s = exec("pbpaste")  fdWrite(stemMaster(), s, len(s))  emit "1" }
+func onStemReset(self, cmd, sender)  { let s = "reset\n"  fdWrite(stemMaster(), s, len(s))  emit "1" }
+func stemApplyFont() {
+  let app = appH()
+  let sz = cocoaNumberVal(cocoaGetAssocKey(app, "stem.fontsize"))
+  let mono = cocoaFontFamily(cocoaMonoFont(sz), msg(cocoaGetAssocKey(app, "stem.fontfam"), "UTF8String"))
+  cocoaSetAssocKey(app, "stem.mono", mono)
+  cocoaSetFont(cocoaGetAssocKey(app, "stem.view"), mono)
+  emit "1"
+}
+func onStemZoomIn(self, cmd, sender)    { let s = cocoaNumberVal(cocoaGetAssocKey(appH(), "stem.fontsize")) + 1  if s > 40 { s = 40 }  cocoaSetAssocKey(appH(), "stem.fontsize", cocoaNumber(s))  stemApplyFont() }
+func onStemZoomOut(self, cmd, sender)   { let s = cocoaNumberVal(cocoaGetAssocKey(appH(), "stem.fontsize")) - 1  if s < 7 { s = 7 }  cocoaSetAssocKey(appH(), "stem.fontsize", cocoaNumber(s))  stemApplyFont() }
+func onStemZoomReset(self, cmd, sender) { cocoaSetAssocKey(appH(), "stem.fontsize", cocoaNumber(13))  stemApplyFont() }
+func onStemFull(self, cmd, sender)      { msg_1(cocoaGetAssocKey(appH(), "stem.win"), "toggleFullScreen:", 0)  emit "1" }
+func onStemHelp(self, cmd, sender)      { exec("open https://krypton-lang.org/programs/stem.html")  emit "1" }
+// Replace or append one key while preserving comments and unknown/advanced keys.
+func cfgSet(cfg, key, value) {
+  let out = ""
+  let found = 0
+  let n = lineCount(cfg)
+  let i = 0
+  while i < n {
+    let line = getLine(cfg, i)
+    let clean = trim(line)
+    let eq = indexOf(clean, "=")
+    if eq > 0 && trim(substring(clean, 0, eq)) == key {
+      out = out + key + " = " + value + "\n"
+      found = 1
+    } else { out = out + line + "\n" }
+    i = i + 1
+  }
+  if found == 0 { out = out + key + " = " + value + "\n" }
+  emit out
+}
+func settingText(key) { emit cocoaGetText(cocoaGetAssocKey(appH(), "stem.setting." + key)) }
+func settingBool(key) {
+  if cocoaState(cocoaGetAssocKey(appH(), "stem.setting." + key)) == 1 { emit "true" }
+  emit "false"
+}
+func stemOpacityThousandths(value) {
+  let v = trim(value)
+  let dot = indexOf(v, ".")
+  if dot < 0 { emit toInt(v) * 1000 }
+  let whole = toInt(substring(v, 0, dot))
+  let frac = substring(v, dot + 1, len(v)) + "000"
+  emit whole * 1000 + toInt(substring(frac, 0, 3))
+}
+func stemSetOpacity(win, bg, value) {
+  let thousandths = stemOpacityThousandths(value)
+  if thousandths < 200 { thousandths = 200 }
+  if thousandths > 1000 { thousandths = 1000 }
+  // objc_msgSend_timer is the existing objk bridge that converts an integer
+  // millisecond value to a fractional double in d0. Objective-C ignores the
+  // unused trailing registers for NSColor.colorWithAlphaComponent:, giving us
+  // an exact 0.2–1.0 CGFloat without rounding through msg_d1. Keep the window
+  // Keep the window backing clear.  The terminal view receives transparentBg,
+  // while the frame and titlebar are painted separately as opaque black.
+  let transparentBg = msg_timer(bg, "colorWithAlphaComponent:", thousandths, 0, "", 0, 0)
+  msg_d1(win, "setAlphaValue:", 1)
+  msg_1(win, "setOpaque:", 0)
+  msg_1(win, "setBackgroundColor:", msg(cls("NSColor"), "clearColor"))
+  emit transparentBg
+}
+func stemBlackSurface(win, x, y, w, h, autoresize) {
+  let box = cocoaCustomView(win, cls("NSBox"), x, y, w, h)
+  msg_1(box, "setBoxType:", 4)
+  msg_1(box, "setBorderType:", 0)
+  msg_1(box, "setFillColor:", cocoaRGB(27, 21, 38))
+  cocoaSetAutoresizing(box, autoresize)
+  emit box
+}
+func stemPaintChrome(win, width, height, pad) {
+  // Four opaque strips form a deep-black frame without putting an opaque
+  // backing behind the translucent terminal canvas.
+  stemBlackSurface(win, 0, 0, width, pad, 2)                    // bottom: grow width
+  stemBlackSurface(win, 0, height - pad, width, pad, 10)       // top: grow width + follow top
+  stemBlackSurface(win, 0, pad, pad, height - pad * 2, 16)     // left: grow height
+  stemBlackSurface(win, width - pad, pad, pad, height - pad * 2, 17) // right: follow right + grow
+  // Native dark titlebars are gray. Paint the titlebar container itself black
+  // while leaving the traffic-light controls and title text above it.
+  let closeButton = msg_1(win, "standardWindowButton:", 0)
+  let titlebar = msg(closeButton, "superview")
+  msg_1(titlebar, "setWantsLayer:", 1)
+  msg_1(msg(titlebar, "layer"), "setBackgroundColor:", msg(cocoaRGB(27, 21, 38), "CGColor"))
+  emit "1"
+}
+func addSettingField(win, cfg, key, label, def, x, y, w) {
+  cocoaPlainLabel(win, label, x, y + 3, 150, 22)
+  let field = cocoaTextField(win, x + 155, y, w - 155, 26)
+  cocoaSetText(field, cfgVal(cfg, key, def))
+  cocoaSetAssocKey(appH(), "stem.setting." + key, field)
+  emit field
+}
+func addSettingCheck(win, cfg, key, label, def, x, y, w) {
+  let box = cocoaCheckbox(win, label, x, y, w, 24)
+  cocoaSetState(box, cfgBool(cfg, key, def))
+  cocoaSetAssocKey(appH(), "stem.setting." + key, box)
+  emit box
+}
+func stemGenerateConfig() {
+  let preview = cocoaGetAssocKey(appH(), "stem.settings.preview")
+  let cfg = cocoaTVGetString(preview)
+  cfg = cfgSet(cfg, "title", settingText("title"))
+  cfg = cfgSet(cfg, "shell", settingText("shell"))
+  cfg = cfgSet(cfg, "working_directory", settingText("working_directory"))
+  cfg = cfgSet(cfg, "term", settingText("term"))
+  cfg = cfgSet(cfg, "font_family", settingText("font_family"))
+  cfg = cfgSet(cfg, "font_size", settingText("font_size"))
+  cfg = cfgSet(cfg, "width", settingText("width"))
+  cfg = cfgSet(cfg, "height", settingText("height"))
+  cfg = cfgSet(cfg, "opacity", settingText("opacity"))
+  cfg = cfgSet(cfg, "padding", settingText("padding"))
+  cfg = cfgSet(cfg, "pane_gap", settingText("pane_gap"))
+  cfg = cfgSet(cfg, "appearance", settingText("appearance"))
+  cfg = cfgSet(cfg, "cursor_style", settingText("cursor_style"))
+  cfg = cfgSet(cfg, "cursor_color", settingText("cursor_color"))
+  cfg = cfgSet(cfg, "foreground", settingText("foreground"))
+  cfg = cfgSet(cfg, "background", settingText("background"))
+  cfg = cfgSet(cfg, "titlebar_transparent", settingBool("titlebar_transparent"))
+  cfg = cfgSet(cfg, "center_on_launch", settingBool("center_on_launch"))
+  cfg = cfgSet(cfg, "start_fullscreen", settingBool("start_fullscreen"))
+  cfg = cfgSet(cfg, "always_on_top", settingBool("always_on_top"))
+  cfg = cfgSet(cfg, "window_shadow", settingBool("window_shadow"))
+  cfg = cfgSet(cfg, "scrollbar", settingBool("scrollbar"))
+  cocoaTVSetString(preview, cfg)
+  emit cfg
+}
+func onStemSettingsGenerate(self, cmd, sender) { stemGenerateConfig()  emit "1" }
+func onStemSettingsSave(self, cmd, sender) {
+  let cfg = stemGenerateConfig()
+  writeFile(msg(cocoaGetAssocKey(appH(), "stem.cfgpath"), "UTF8String"), cfg)
+  onStemReload(0, 0, 0)
+  cocoaAlert("STEM Settings", "Configuration saved. Visual settings were applied; open a new window for shell and session changes.")
+  emit "1"
+}
+func onStemConfig(self, cmd, sender) {
+  let app = appH()
+  let existing = cocoaGetAssocKey(app, "stem.settingswin")
+  if existing != 0 { cocoaShow(existing, app)  emit "1" }
+  let cfg = readFile(msg(cocoaGetAssocKey(app, "stem.cfgpath"), "UTF8String"))
+  let win = cocoaWindow(app, "STEM Settings — GUI + generated stem.conf", 1040, 720)
+  cocoaSetWindowMinSize(win, 900, 620)
+  cocoaSetAssocKey(app, "stem.settingswin", win)
+  cocoaPlainLabel(win, "Common settings", 24, 676, 420, 26)
+  cocoaPlainLabel(win, "Generated config code (advanced settings remain editable)", 500, 676, 510, 26)
+  let y = 640
+  addSettingField(win, cfg, "title", "Window title", "STEM", 24, y, 440)
+  addSettingField(win, cfg, "shell", "Shell", "/bin/zsh", 24, y - 36, 440)
+  addSettingField(win, cfg, "working_directory", "Working directory", "~", 24, y - 72, 440)
+  addSettingField(win, cfg, "term", "TERM", "xterm-256color", 24, y - 108, 440)
+  addSettingField(win, cfg, "font_family", "Font family", cfgAlias(cfg, "font_family", "font", "MesloLGS Nerd Font"), 24, y - 144, 440)
+  addSettingField(win, cfg, "font_size", "Font size", "13", 24, y - 180, 440)
+  addSettingField(win, cfg, "width", "Window width", "1120", 24, y - 216, 440)
+  addSettingField(win, cfg, "height", "Window height", "740", 24, y - 252, 440)
+  addSettingField(win, cfg, "opacity", "Opacity (0.2–1.0)", "0.80", 24, y - 288, 440)
+  addSettingField(win, cfg, "padding", "Outer padding", "10", 24, y - 324, 440)
+  addSettingField(win, cfg, "pane_gap", "Pane gap", "2", 24, y - 360, 440)
+  addSettingField(win, cfg, "appearance", "Appearance", "dark", 24, y - 396, 440)
+  addSettingField(win, cfg, "cursor_style", "Cursor style", "bar", 24, y - 432, 440)
+  addSettingField(win, cfg, "cursor_color", "Cursor color", "#8B5CF6", 24, y - 468, 440)
+  addSettingField(win, cfg, "foreground", "Foreground", cfgAlias(cfg, "foreground", "fg", "#D8DAD4"), 24, y - 504, 440)
+  addSettingField(win, cfg, "background", "Background", cfgAlias(cfg, "background", "bg", "#05070C"), 24, y - 540, 440)
+  addSettingCheck(win, cfg, "titlebar_transparent", "Transparent titlebar", 1, 24, 62, 190)
+  addSettingCheck(win, cfg, "center_on_launch", "Center new windows", 1, 220, 62, 190)
+  addSettingCheck(win, cfg, "start_fullscreen", "Start fullscreen", 0, 24, 36, 190)
+  addSettingCheck(win, cfg, "always_on_top", "Always on top", 0, 220, 36, 190)
+  addSettingCheck(win, cfg, "window_shadow", "Window shadow", 1, 24, 10, 190)
+  addSettingCheck(win, cfg, "scrollbar", "Scrollbar", 1, 220, 10, 190)
+  let preview = cocoaScrollText(win, 500, 62, 516, 600)
+  cocoaTVSetString(preview, cfg)
+  cocoaTVNoWrap(preview)
+  cocoaSetFont(preview, cocoaMonoFont(11))
+  cocoaSetAssocKey(app, "stem.settings.preview", preview)
+  let gen = cocoaButton(win, "Generate Preview", 500, 18, 150, 32)
+  cocoaOnClickKeyed(gen, "stem_settings_generate", funcptr(onStemSettingsGenerate))
+  let save = cocoaButton(win, "Save & Apply", 860, 18, 156, 32)
+  cocoaOnClickKeyed(save, "stem_settings_save", funcptr(onStemSettingsSave))
+  cocoaShow(win, app)
+  emit "1"
+}
+func onStemReload(self, cmd, sender) {
+  let cfg = readFile(msg(cocoaGetAssocKey(appH(), "stem.cfgpath"), "UTF8String"))
+  cocoaSetAssocKey(appH(), "stem.fontsize", cocoaNumber(toInt(cfgVal(cfg, "font_size", "13"))))
+  cocoaSetAssocKey(appH(), "stem.fontfam", nsString(cfgAlias(cfg, "font_family", "font", "JetBrainsMono Nerd Font Mono")))
+  cocoaSetAssocKey(appH(), "stem.cursorstyle", nsString(cfgVal(cfg, "cursor_style", "bar")))
+  cocoaSetAssocKey(appH(), "stem.cursorcolor", cfgRGB(cfg, "cursor_color", 139, 92, 246))
+  stemApplyFont()
+  let win = cocoaGetAssocKey(appH(), "stem.win")
+  let fg = cfgRGBAlias(cfg, "foreground", "fg", 216, 218, 212)
+  let bg = stemSetOpacity(win, cfgRGBAlias(cfg, "background", "bg", 5, 7, 12), cfgVal(cfg, "opacity", "0.80"))
+  cocoaSetAssocKey(appH(), "stem.fgc", fg)
+  cocoaSetAssocKey(appH(), "stem.bgc", bg)
+  msg_1(win, "setTitle:", nsString(cfgVal(cfg, "title", "STEM")))
+  let docs = cocoaGetAssocKey(appH(), "stem.pdocs")
+  let backs = cocoaGetAssocKey(appH(), "stem.pbacks")
+  let dn = cocoaArrayCount(docs)
+  let di = 0
+  while di < dn {
+    cocoaSetBg(cocoaArrayGet(docs, di), bg)
+    cocoaSetTextColor(cocoaArrayGet(docs, di), fg)
+    msg_1(cocoaArrayGet(backs, di), "setFillColor:", bg)
+    di = di + 1
+  }
+  emit "1"
+}
+func onStemAbout(self, cmd, sender) { exec("osascript -e 'display dialog \"stem " + fromCharCode(8212) + " a pure-Krypton terminal on the objk Objective-C FFI. No Obj-C source.\\n\\nkrypton-lang.org/programs/stem.html\" buttons {\"OK\"} default button \"OK\" with title \"About stem\"' >/dev/null 2>&1 &")  emit "1" }
+// strip ANSI CSI sequences for plain-text copy
+func stemStripAnsi(s) {
+  let out = ""
+  let n = len(s)
+  let i = 0
+  let esc = fromCharCode(27)
+  while i < n {
+    let ch = substring(s, i, i + 1)
+    if ch == esc {
+      i = i + 1
+      if i < n { if substring(s, i, i + 1) == "[" {
+        i = i + 1
+        let scanning = 1
+        while scanning == 1 {
+          if i >= n { scanning = 0 }
+          else { let c = charCode(substring(s, i, i + 1))  i = i + 1  if c >= 64 { if c <= 126 { scanning = 0 } } }
+        }
+      } }
+    } else { out = out + ch  i = i + 1 }
+  }
+  emit out
+}
+func onStemCopy(self, cmd, sender) {
+  let r = cocoaGetAssocKey(appH(), "stem.lastrender")
+  if r == 0 { emit "1" }
+  writeFile("/tmp/stemcopy", stemStripAnsi(msg(r, "UTF8String")))
+  exec("pbcopy < /tmp/stemcopy")
+  emit "1"
+}
+func onStemUpdate(self, cmd, sender) {
+  exec("(brew update >/dev/null 2>&1; if brew outdated --cask t3m3d/krypton/stem | grep -q stem; then brew upgrade --cask t3m3d/krypton/stem >/dev/null 2>&1 && osascript -e 'display notification \"Updated stem to the latest version.\" with title \"stem\"'; else osascript -e 'display notification \"stem is up to date.\" with title \"stem\"'; fi) &")
+  emit "1"
+}
+func onStemSecure(self, cmd, sender) {
+  let cur = brainFlagS("stem.secure", 0)
+  let nv = 1
+  if cur == 1 { nv = 0 }
+  cocoaSetAssocKey(appH(), "stem.secure", cocoaNumber(nv))
+  msg_1(sender, "setState:", nv)
+  emit "1"
+}
+func onStemDefault(self, cmd, sender) {
+  exec("osascript -e 'display dialog \"macOS has no single default-terminal setting. To open shell scripts (.command/.tool) with stem, right-click one " + fromCharCode(8594) + " Get Info " + fromCharCode(8594) + " Open with: stem " + fromCharCode(8594) + " Change All.\" buttons {\"OK\"} default button \"OK\" with title \"Make stem Default Terminal\"' >/dev/null 2>&1 &")
+  emit "1"
+}
+func brainFlagS(key, def) {
+  let v = cocoaGetAssocKey(appH(), key)
+  if v == 0 { emit def }
+  emit cocoaNumberVal(v)
+}
+
+// ── panes / splits (2-pane) ─────────────────────────────────────────────
+func stemKeyClass() {
+  let c = objc_lookUpClass("StemKeys")
+  if c == 0 {
+    c = cocoaViewClassNew("StemKeys")
+    cocoaClassAddMethod(c, "keyDown:", funcptr(onKey), "v@:@")
+    cocoaClassAddMethod(c, "mouseDown:", funcptr(onMouse), "v@:@")
+    cocoaClassAddMethod(c, "acceptsFirstResponder", funcptr(acceptsFR), "c@:")
+    cocoaClassRegister(c)
+  }
+  emit c
+}
+func onStemWindowResize(self, cmd, note) {
+  let app = appH()
+  let content = msg(cocoaGetAssocKey(app, "stem.win"), "contentView")
+  let w = msgRectWidth(content, "frame")
+  let h = msgRectHeight(content, "frame")
+  if w > 0 && h > 0 {
+    // NSWindow sends this synchronously during live resize. Move pane frames
+    // inside that event, before AppKit presents the next window frame.
+    retileFrames(w, h)
+    cocoaSetAssocKey(app, "stem.pendingw", cocoaNumber(w))
+    cocoaSetAssocKey(app, "stem.pendingh", cocoaNumber(h))
+    cocoaSetAssocKey(app, "stem.resizewait", cocoaNumber(0))
+  }
+  emit "1"
+}
+func stemWindowDelegateClass() {
+  let c = objc_lookUpClass("StemWindowDelegate")
+  if c == 0 {
+    c = cocoaClassNew("StemWindowDelegate")
+    cocoaClassAddMethod(c, "windowDidResize:", funcptr(onStemWindowResize), "v@:@")
+    cocoaClassAddMethod(c, "windowShouldClose:", funcptr(ksShouldClose), "c@:@")
+    cocoaClassRegister(c)
+  }
+  emit c
+}
+func stemForkPty(pcols, prows, shell) {
+  let m = ptyMaster("/dev/ptmx")
+  let slave = ptySlaveName(m)
+  ptyForkExec(slave, shell)
+  let tries = 0
+  let szd = 0
+  while tries < 60 {
+    if szd == 0 { if ptySetSize(m, prows, pcols) == 0 { szd = 1 } else { sleepUs(0, 10000)  tries = tries + 1 } }
+    else { tries = 60 }
+  }
+  fdSetNonblock(m)
+  // env + login handled by the wrapper script we exec (see just-run); nothing
+  // typed into the pty, so the prompt comes up clean.
+  emit m
+}
+func stemMakePaneView(m, x, y, w, h, pcols, prows) {
+  let app = appH()
+  let win = cocoaGetAssocKey(app, "stem.win")
+  // A dedicated NSBox is the composited terminal surface. Unlike NSTextView
+  // and NSScrollView background drawing, NSBox reliably honors NSColor alpha.
+  let back = cocoaCustomView(win, cls("NSBox"), x, y, w, h)
+  msg_1(back, "setBoxType:", 4)
+  msg_1(back, "setBorderType:", 0)
+  msg_1(back, "setFillColor:", cocoaGetAssocKey(app, "stem.bgc"))
+  cocoaSetAutoresizing(back, 0)
+  let view = cocoaScrollText(win, x, y, w, h)
+  let scroll = msg(view, "enclosingScrollView")
+  msg_1(scroll, "setBorderType:", 0)
+  msg_1(scroll, "setHasVerticalScroller:", brainFlagS("stem.scrollbar", 1))
+  msg_1(scroll, "setHasHorizontalScroller:", 0)
+  // NSScrollView and NSClipView otherwise paint their own opaque backgrounds,
+  // hiding the alpha supplied by the terminal NSTextView.
+  msg_1(scroll, "setDrawsBackground:", 0)
+  msg_1(msg(scroll, "contentView"), "setDrawsBackground:", 0)
+  msg_1(view, "setEditable:", 0)
+  msg_1(view, "setSelectable:", 0)
+  msg_1(view, "setDrawsBackground:", 0)
+  // PTY grid owns wrapping. NSTextView wrapping same rows again creates extra
+  // lines, activates scroller, and can wedge rendering after a wide resize.
+  msg_1(view, "setHorizontallyResizable:", 1)
+  let container = msg(view, "textContainer")
+  msg_1(container, "setWidthTracksTextView:", 0)
+  msg_d2(container, "setContainerSize:", 1000000, 1000000)
+  cocoaSetFont(view, cocoaGetAssocKey(app, "stem.mono"))
+  cocoaSetBg(view, cocoaGetAssocKey(app, "stem.bgc"))
+  cocoaSetTextColor(view, cocoaGetAssocKey(app, "stem.fgc"))
+  let kview = cocoaCustomView(win, stemKeyClass(), x, y, w, h)
+  // Single-pane terminal follows both dimensions of its window. Split layouts
+  // may replace these frames explicitly through retile().
+  cocoaSetAutoresizing(msg(view, "enclosingScrollView"), 0)
+  cocoaSetAutoresizing(kview, 0)
+  cocoaSetAssocKey(kview, "ptyfd", cocoaNumber(m))
+  cocoaSetAssocKey(kview, "paneidx", cocoaNumber(cocoaArrayCount(cocoaGetAssocKey(app, "stem.pkviews"))))
+  cocoaArrayAdd(cocoaGetAssocKey(app, "stem.pmasters"), cocoaNumber(m))
+  cocoaArrayAdd(cocoaGetAssocKey(app, "stem.pbacks"), back)
+  cocoaArrayAdd(cocoaGetAssocKey(app, "stem.pscrolls"), msg(view, "enclosingScrollView"))
+  cocoaArrayAdd(cocoaGetAssocKey(app, "stem.pviews"), msg(view, "textStorage"))
+  cocoaArrayAdd(cocoaGetAssocKey(app, "stem.pdocs"), view)
+  cocoaArrayAdd(cocoaGetAssocKey(app, "stem.pcols"), cocoaNumber(pcols))
+  cocoaArrayAdd(cocoaGetAssocKey(app, "stem.prows"), cocoaNumber(prows))
+  cocoaArrayAdd(cocoaGetAssocKey(app, "stem.pkviews"), kview)
+  emit kview
+}
+func paneCount() { emit cocoaArrayCount(treeLeaves()) }
+// set pane idx's frame + pty size + stored cols/rows
+func setPaneFrame(idx, x, y, w, h) {
+  let app = appH()
+  msg_frame(cocoaArrayGet(cocoaGetAssocKey(app, "stem.pscrolls"), idx), "setFrame:", x, y, w, h)
+  msg_frame(cocoaArrayGet(cocoaGetAssocKey(app, "stem.pkviews"), idx), "setFrame:", x, y, w, h)
+  msg_frame(cocoaArrayGet(cocoaGetAssocKey(app, "stem.pbacks"), idx), "setFrame:", x, y, w, h)
+  emit "1"
+}
+func setPane(idx, x, y, w, h) {
+  let app = appH()
+  let cellw = cocoaNumberVal(cocoaGetAssocKey(app, "stem.cellw1000"))
+  let cellh = cocoaNumberVal(cocoaGetAssocKey(app, "stem.cellh1000"))
+  let pcols = (w * 1000) / cellw
+  let prows = (h * 1000) / cellh
+  if pcols < 4 { pcols = 4 }
+  if prows < 2 { prows = 2 }
+  setPaneFrame(idx, x, y, w, h)
+  ptySetSize(cocoaNumberVal(cocoaArrayGet(cocoaGetAssocKey(app, "stem.pmasters"), idx)), prows, pcols)
+  cocoaArraySet(cocoaGetAssocKey(app, "stem.pcols"), idx, cocoaNumber(pcols))
+  cocoaArraySet(cocoaGetAssocKey(app, "stem.prows"), idx, cocoaNumber(prows))
+  emit "1"
+}
+
+// Track the real AppKit content rectangle. When the user resizes the window,
+// retile panes and send each PTY its new character geometry.
+func stemSyncWindowSize() {
+  let app = appH()
+  let content = msg(cocoaGetAssocKey(app, "stem.win"), "contentView")
+  let w = msgRectWidth(content, "frame")
+  let h = msgRectHeight(content, "frame")
+  if w < 1 || h < 1 { emit 0 }
+  let oldw = cocoaNumberVal(cocoaGetAssocKey(app, "stem.w"))
+  let oldh = cocoaNumberVal(cocoaGetAssocKey(app, "stem.h"))
+  if w == oldw && h == oldh {
+    cocoaSetAssocKey(app, "stem.pendingw", cocoaNumber(w))
+    cocoaSetAssocKey(app, "stem.pendingh", cocoaNumber(h))
+    cocoaSetAssocKey(app, "stem.resizewait", cocoaNumber(0))
+    emit 0
+  }
+  let pendingw = cocoaNumberVal(cocoaGetAssocKey(app, "stem.pendingw"))
+  let pendingh = cocoaNumberVal(cocoaGetAssocKey(app, "stem.pendingh"))
+  if w != pendingw || h != pendingh {
+    // Apply frames once per real geometry change. Reapplying identical frames
+    // during debounce repaints split-pane top edges and visibly flickers.
+    // PTY rows/columns stay debounced below to avoid resize storms.
+    retileFrames(w, h)
+    cocoaSetAssocKey(app, "stem.pendingw", cocoaNumber(w))
+    cocoaSetAssocKey(app, "stem.pendingh", cocoaNumber(h))
+    cocoaSetAssocKey(app, "stem.resizewait", cocoaNumber(0))
+    emit 0
+  }
+  let wait = cocoaNumberVal(cocoaGetAssocKey(app, "stem.resizewait")) + 1
+  cocoaSetAssocKey(app, "stem.resizewait", cocoaNumber(wait))
+  if wait < 6 { emit 0 }
+  cocoaSetAssocKey(app, "stem.w", cocoaNumber(w))
+  cocoaSetAssocKey(app, "stem.h", cocoaNumber(h))
+  retile(0)
+  emit 1
+}
+// ── split tree ──────────────────────────────────────────────────────────
+// node = NSArray. leaf: [0, paneIdx]. split: [1, axis, childA, childB]
+// (axis 1 = side-by-side columns, 2 = stacked rows; A = left/top, B = right/bottom)
+func mkLeaf(idx) { let a = cocoaArray()  cocoaArrayAdd(a, cocoaNumber(0))  cocoaArrayAdd(a, cocoaNumber(idx))  emit a }
+func mkSplit(axis, na, nb) { let a = cocoaArray()  cocoaArrayAdd(a, cocoaNumber(1))  cocoaArrayAdd(a, cocoaNumber(axis))  cocoaArrayAdd(a, na)  cocoaArrayAdd(a, nb)  emit a }
+func nodeType(n) { emit cocoaNumberVal(cocoaArrayGet(n, 0)) }
+func leafIdx(n)  { emit cocoaNumberVal(cocoaArrayGet(n, 1)) }
+func splitAxis(n){ emit cocoaNumberVal(cocoaArrayGet(n, 1)) }
+func splitA(n)   { emit cocoaArrayGet(n, 2) }
+func splitB(n)   { emit cocoaArrayGet(n, 3) }
+func layoutTree(n, x, y, w, h) {
+  if nodeType(n) == 0 { setPane(leafIdx(n), x, y, w, h)  emit "1" }
+  let gap = brainFlagS("stem.panegap", 2)
+  if splitAxis(n) == 1 {
+    let half = (w - gap) / 2
+    layoutTree(splitA(n), x, y, half, h)
+    layoutTree(splitB(n), x + half + gap, y, w - half - gap, h)
+  }
+  else {
+    let half = (h - gap) / 2
+    layoutTree(splitA(n), x, y + half + gap, w, h - half - gap)
+    layoutTree(splitB(n), x, y, w, half)
+  }
+  emit "1"
+}
+func layoutFrameTree(n, x, y, w, h) {
+  if nodeType(n) == 0 { setPaneFrame(leafIdx(n), x, y, w, h)  emit "1" }
+  let gap = brainFlagS("stem.panegap", 2)
+  if splitAxis(n) == 1 {
+    let half = (w - gap) / 2
+    layoutFrameTree(splitA(n), x, y, half, h)
+    layoutFrameTree(splitB(n), x + half + gap, y, w - half - gap, h)
+  }
+  else {
+    let half = (h - gap) / 2
+    layoutFrameTree(splitA(n), x, y + half + gap, w, h - half - gap)
+    layoutFrameTree(splitB(n), x, y, w, half)
+  }
+  emit "1"
+}
+func retileFrames(W, H) {
+  let pad = brainFlagS("stem.padding", 0)
+  layoutFrameTree(cocoaGetAssocKey(appH(), "stem.tree"), 320 + pad, 28 + pad, W - 320 - pad * 2, H - 236 - pad * 2)
+  emit "1"
+}
+func splitTree(n, target, axis, newIdx, before) {
+  if nodeType(n) == 0 {
+    if leafIdx(n) == target {
+      if before == 1 { emit mkSplit(axis, mkLeaf(newIdx), mkLeaf(target)) }
+      emit mkSplit(axis, mkLeaf(target), mkLeaf(newIdx))
+    }
+    emit n
+  }
+  emit mkSplit(splitAxis(n), splitTree(splitA(n), target, axis, newIdx, before), splitTree(splitB(n), target, axis, newIdx, before))
+}
+func closeTree(n, target) {
+  if nodeType(n) == 0 { emit n }
+  let a = splitA(n)
+  let b = splitB(n)
+  if nodeType(a) == 0 { if leafIdx(a) == target { emit b } }
+  if nodeType(b) == 0 { if leafIdx(b) == target { emit a } }
+  emit mkSplit(splitAxis(n), closeTree(a, target), closeTree(b, target))
+}
+func collectLeaves(n, arr) {
+  if nodeType(n) == 0 { cocoaArrayAdd(arr, cocoaNumber(leafIdx(n)))  emit "1" }
+  collectLeaves(splitA(n), arr)
+  collectLeaves(splitB(n), arr)
+  emit "1"
+}
+func treeLeaves() { let a = cocoaArray()  collectLeaves(cocoaGetAssocKey(appH(), "stem.tree"), a)  emit a }
+func nextFreeIdx() {
+  let leaves = treeLeaves()
+  let n = cocoaArrayCount(leaves)
+  let i = 0
+  while i < 4 {
+    let used = 0
+    let j = 0
+    while j < n { if cocoaNumberVal(cocoaArrayGet(leaves, j)) == i { used = 1 }  j = j + 1 }
+    if used == 0 { emit i }
+    i = i + 1
+  }
+  emit 0 - 1
+}
+// lay out the tree + show its leaves, hide the rest
+func retile(axis) {
+  let app = appH()
+  let W = cocoaNumberVal(cocoaGetAssocKey(app, "stem.w"))
+  let H = cocoaNumberVal(cocoaGetAssocKey(app, "stem.h"))
+  let pad = brainFlagS("stem.padding", 0)
+  layoutTree(cocoaGetAssocKey(app, "stem.tree"), 320 + pad, 28 + pad, W - 320 - pad * 2, H - 236 - pad * 2)
+  let leaves = treeLeaves()
+  let ln = cocoaArrayCount(leaves)
+  let scrolls = cocoaGetAssocKey(app, "stem.pscrolls")
+  let kviews = cocoaGetAssocKey(app, "stem.pkviews")
+  let backs = cocoaGetAssocKey(app, "stem.pbacks")
+  let splitMask = 0
+  // Split widths are laid out by Stem, but pane heights must follow AppKit's
+  // live resize synchronously. Without NSViewHeightSizable (16), the window
+  // grows before the timer callback and exposes a flickering strip at top.
+  if ln > 1 { splitMask = 0 }
+  let i = 0
+  while i < 4 {
+    let vis = 0
+    let j = 0
+    while j < ln { if cocoaNumberVal(cocoaArrayGet(leaves, j)) == i { vis = 1 }  j = j + 1 }
+    let hid = 1
+    if vis == 1 { hid = 0 }
+    msg_1(cocoaArrayGet(scrolls, i), "setHidden:", hid)
+    msg_1(cocoaArrayGet(kviews, i), "setHidden:", hid)
+    msg_1(cocoaArrayGet(backs, i), "setHidden:", hid)
+    cocoaSetAutoresizing(cocoaArrayGet(scrolls, i), splitMask)
+    cocoaSetAutoresizing(cocoaArrayGet(kviews, i), splitMask)
+    cocoaSetAutoresizing(cocoaArrayGet(backs, i), splitMask)
+    i = i + 1
+  }
+  // repaint each visible pane's prompt at its new size (the grid was rebuilt)
+  let masters = cocoaGetAssocKey(app, "stem.pmasters")
+  let k = 0
+  while k < ln { fdWrite(cocoaNumberVal(cocoaArrayGet(masters, cocoaNumberVal(cocoaArrayGet(leaves, k)))), fromCharCode(12), 1)  k = k + 1 }
+  cocoaSetAssocKey(app, "stem.splitdirty", cocoaNumber(1))
+  emit "1"
+}
+// dir: 1=right 2=left 3=top 4=bottom — splits ONLY the focused pane (nested)
+func doSplit(dir) {
+  let app = appH()
+  let newIdx = nextFreeIdx()
+  if newIdx < 0 { emit "1" }
+  let fIdx = focusedIdx()
+  let axis = 1
+  if dir >= 3 { axis = 2 }
+  let before = 0
+  if dir == 2 { before = 1 }
+  if dir == 3 { before = 1 }
+  cocoaSetAssocKey(app, "stem.tree", splitTree(cocoaGetAssocKey(app, "stem.tree"), fIdx, axis, newIdx, before))
+  retile(1)
+  cocoaSetAssocKey(app, "stem.focusidx", cocoaNumber(newIdx))
+  cocoaMakeFirstResponder(cocoaGetAssocKey(app, "stem.win"), cocoaArrayGet(cocoaGetAssocKey(app, "stem.pkviews"), newIdx))
+  emit "1"
+}
+func onSplitRight(self, cmd, sender)  { doSplit(1)  emit "1" }
+func onSplitLeft(self, cmd, sender)   { doSplit(2)  emit "1" }
+func onSplitTop(self, cmd, sender)    { doSplit(3)  emit "1" }
+func onSplitBottom(self, cmd, sender) { doSplit(4)  emit "1" }
+func focusedIdx() {
+  let f = cocoaGetAssocKey(appH(), "stem.focusidx")
+  if f == 0 { emit 0 }
+  emit cocoaNumberVal(f)
+}
+// click a pane -> focus it (so the next split targets it)
+func onMouse(self, cmd, event) {
+  cocoaSetAssocKey(appH(), "stem.focusidx", cocoaGetAssocKey(self, "paneidx"))
+  cocoaMakeFirstResponder(cocoaGetAssocKey(appH(), "stem.win"), self)
+  emit "1"
+}
+func onNewTab(self, cmd, sender)  { shellRun("/usr/bin/open -n " + shellQuote(nsToStr(msg(msg(cls("NSBundle"), "mainBundle"), "bundlePath"))))  emit "1" }
+func onCloseAll(self, cmd, sender){ ksQuit(self, cmd, sender) emit "1" }
+// close focused pane; if last pane, close the window
+func onClosePane(self, cmd, sender) {
+  let app = appH()
+  if cocoaArrayCount(treeLeaves()) <= 1 { msg_1(cocoaGetAssocKey(app, "stem.win"), "performClose:", 0)  emit "1" }
+  cocoaSetAssocKey(app, "stem.tree", closeTree(cocoaGetAssocKey(app, "stem.tree"), focusedIdx()))
+  retile(1)
+  let firstIdx = cocoaNumberVal(cocoaArrayGet(treeLeaves(), 0))
+  cocoaSetAssocKey(app, "stem.focusidx", cocoaNumber(firstIdx))
+  cocoaMakeFirstResponder(cocoaGetAssocKey(app, "stem.win"), cocoaArrayGet(cocoaGetAssocKey(app, "stem.pkviews"), firstIdx))
+  emit "1"
+}
+
+func defaultConfig() {
+  let resources = msg(msg(cls("NSBundle"), "mainBundle"), "resourcePath")
+  if resources != 0 {
+    let bundled = readFile(msg(resources, "UTF8String") + "/stem.conf")
+    if len(bundled) > 0 { emit bundled }
+  }
+  emit "# STEM configuration\ntitle = STEM\nshell = /bin/zsh\nworking_directory = ~\nterm = xterm-256color\nfont_family = JetBrainsMono Nerd Font Mono\nfont_size = 13\ncols = 108\nrows = 30\nwidth = 1000\nheight = 650\npadding = 8\npane_gap = 2\nopacity = 1.0\nappearance = dark\nscrollbar = true\ncursor_style = bar\ncursor_color = #8B5CF6\nforeground = #D8DAD4\nbackground = #05070C\n"
+}
+
+just run {
+  if arg("0") == "--selftest" { ksSelfTest() exit("0") }
+  let resources = msg(msg(cls("NSBundle"), "mainBundle"), "resourcePath")
+  let cfgPath = nsToStr(resources) + "/stem.conf"
+  let cfg = readFile(cfgPath)
+  if len(cfg) == 0 { cfg = "title = Krypsec\nwidth = 1280\nheight = 820\nminimum_width = 1000\nminimum_height = 600\nfont_size = 13\ncols = 110\nrows = 32\npadding = 8\nopacity = 1.0\n" }
+
+  let cols  = toInt(cfgVal(cfg, "cols", "108"))
+  // KryoFetch's two-column macOS report needs 104–107 cells. Older Stem
+  // configs used 100 despite the default window having room, wrapping the
+  // trailing percentage onto a second line. Preserve larger user choices.
+  if cols < 108 { cols = 108 }
+  let rows  = toInt(cfgVal(cfg, "rows", "28"))
+  let width = toInt(cfgVal(cfg, "width", "760"))
+  let height = toInt(cfgVal(cfg, "height", "500"))
+  let shell = cfgVal(cfg, "shell", "/bin/zsh")
+  if shell == "" { shell = "/bin/zsh" }
+  let termName = cfgVal(cfg, "term", "xterm-256color")
+  let cwd = cfgVal(cfg, "working_directory", "~")
+  if cwd == "~" { cwd = environ("HOME") }
+
+  // Finder-launched apps inherit launchd's minimal env (no Homebrew PATH), so a
+  // plain shell sources ~/.zshrc with `$(brew --prefix)` failing -> bare prompt.
+  // Write a tiny wrapper that exec's a LOGIN shell (sources ~/.zprofile -> PATH),
+  // then fork the wrapper. No typed setup string in the pty -> no echo to clean.
+  // p10k's gitstatusd can't exec under the ad-hoc-signed app bundle (AMFI), so
+  // p10k hangs forever waiting for it -> blank prompt. Disable gitstatus +
+  // instant-prompt so p10k draws immediately (loses only the git segment).
+  let temporary = trim(exec("/usr/bin/mktemp -d /tmp/krypsec.XXXXXXXX"))
+  if temporary == "" { printErr("Cannot create private session directory.\n") exit("1") }
+  let wrapper = temporary + "/launch.zsh"
+  writeFile(wrapper, "#!/bin/zsh -f\nexport TERM=xterm-256color TERM_PROGRAM=krypsec COLORTERM=truecolor\nexport PATH=" + shellQuote(ksSearchPath()) + "\ncd " + shellQuote(environ("HOME")) + " || exit 1\nexec /bin/zsh -f\n")
+  shellRun("/bin/chmod 700 " + shellQuote(wrapper))
+
+  // fork ALL 4 pane shells BEFORE cocoaInit + render them warm from frame 0
+  // (only the original, warm, pre-init pane reflows correctly on resize). Split
+  // just reveals + sizes a pre-warmed pane.
+  let m0 = stemForkPty(cols, rows, wrapper)
+  let m1 = stemForkPty(cols, rows, wrapper)
+  let m2 = stemForkPty(cols, rows, wrapper)
+  let m3 = stemForkPty(cols, rows, wrapper)
+
+  let app = cocoaInit()
+  ksSet("temporary", nsString(temporary))
+  cocoaSetAssocKey(app, "stem.cfgpath", nsString(cfgPath))
+  let bar = cocoaMenuBar(app)
+  // app menu (system bolds the first menu as the app name)
+  let appMenu = cocoaMenuAdd(bar, "Krypsec")
+  cocoaMenuItem(appMenu, "About Krypsec", "", funcptr(ksAbout))
+  cocoaMenuSeparator(appMenu)
+  cocoaMenuItem(appMenu, "Secure Keyboard Entry", "", funcptr(onStemSecure))
+  cocoaMenuSeparator(appMenu)
+  let svcMenu = cocoaSubmenuIn(appMenu, "Services")
+  msg_1(app, "setServicesMenu:", svcMenu)
+  cocoaMenuSeparator(appMenu)
+  cocoaMenuItemSel(appMenu, "Hide Krypsec", "h", "hide:")
+  cocoaMenuItemSel(appMenu, "Hide Others", "", "hideOtherApplications:")
+  cocoaMenuItemSel(appMenu, "Show All", "", "unhideAllApplications:")
+  cocoaMenuSeparator(appMenu)
+  cocoaMenuItem(appMenu, "Quit Krypsec", "q", funcptr(ksQuit))
+  let fileMenu = cocoaMenuAdd(bar, "File")
+  cocoaMenuItem(fileMenu, "New Window", "n", funcptr(onStemNewWin))
+  cocoaMenuSeparator(fileMenu)
+  cocoaMenuItem(fileMenu, "Split Right", "d", funcptr(onSplitRight))
+  cocoaMenuItem(fileMenu, "Split Left", "D", funcptr(onSplitLeft))
+  cocoaMenuItem(fileMenu, "Split Top", "", funcptr(onSplitTop))
+  cocoaMenuItem(fileMenu, "Split Bottom", "", funcptr(onSplitBottom))
+  cocoaMenuSeparator(fileMenu)
+  cocoaMenuItem(fileMenu, "Close Pane", "", funcptr(onClosePane))
+  cocoaMenuItemSel(fileMenu, "Close Window", "w", "performClose:")
+  cocoaMenuItem(fileMenu, "Close All Windows", "", funcptr(onCloseAll))
+  let shMenu = cocoaMenuAdd(bar, "Shell")
+  cocoaMenuItem(shMenu, "Clear", "k", funcptr(onStemClear))
+  cocoaMenuItem(shMenu, "Reset", "", funcptr(onStemReset))
+  let edMenu = cocoaMenuAdd(bar, "Edit")
+  cocoaMenuItem(edMenu, "Copy", "c", funcptr(onStemCopy))
+  cocoaMenuItem(edMenu, "Paste", "v", funcptr(onStemPaste))
+  cocoaMenuItemSel(edMenu, "Select All", "a", "selectAll:")
+  let viewMenu = cocoaMenuAdd(bar, "View")
+  cocoaMenuItem(viewMenu, "Zoom In", "=", funcptr(onStemZoomIn))
+  cocoaMenuItem(viewMenu, "Zoom Out", "-", funcptr(onStemZoomOut))
+  cocoaMenuItem(viewMenu, "Reset Zoom", "0", funcptr(onStemZoomReset))
+  cocoaMenuSeparator(viewMenu)
+  cocoaMenuItem(viewMenu, "Enter Full Screen", "f", funcptr(onStemFull))
+  let winMenu = cocoaMenuAdd(bar, "Window")
+  cocoaMenuItemSel(winMenu, "Minimize", "m", "performMiniaturize:")
+  cocoaMenuItemSel(winMenu, "Zoom", "", "performZoom:")
+  let helpMenu = cocoaMenuAdd(bar, "Help")
+  cocoaMenuItem(helpMenu, "stem on the web", "", funcptr(onStemHelp))
+
+  // palette cache (0-15 from config, 16-255 computed)
+  let pal = cocoaArray()
+  let pn = 0
+  while pn < 256 {
+    let c = color256def(pn)
+    if pn == 0  { c = cfgRGB(cfg, "color0",  0, 0, 0) }
+    if pn == 1  { c = cfgRGB(cfg, "color1",  205, 49, 49) }
+    if pn == 2  { c = cfgRGB(cfg, "color2",  13, 188, 121) }
+    if pn == 3  { c = cfgRGB(cfg, "color3",  229, 229, 16) }
+    if pn == 4  { c = cfgRGB(cfg, "color4",  36, 114, 200) }
+    if pn == 5  { c = cfgRGB(cfg, "color5",  188, 63, 188) }
+    if pn == 6  { c = cfgRGB(cfg, "color6",  17, 168, 205) }
+    if pn == 7  { c = cfgRGB(cfg, "color7",  229, 229, 229) }
+    if pn == 8  { c = cfgRGB(cfg, "color8",  102, 102, 102) }
+    if pn == 9  { c = cfgRGB(cfg, "color9",  241, 76, 76) }
+    if pn == 10 { c = cfgRGB(cfg, "color10", 35, 209, 139) }
+    if pn == 11 { c = cfgRGB(cfg, "color11", 245, 245, 67) }
+    if pn == 12 { c = cfgRGB(cfg, "color12", 59, 142, 234) }
+    if pn == 13 { c = cfgRGB(cfg, "color13", 214, 112, 214) }
+    if pn == 14 { c = cfgRGB(cfg, "color14", 41, 184, 219) }
+    if pn == 15 { c = cfgRGB(cfg, "color15", 255, 255, 255) }
+    cocoaArrayAdd(pal, c)
+    pn = pn + 1
+  }
+  cocoaSetAssocKey(app, "stem.pal", pal)
+
+  let win = cocoaWindow(app, cfgVal(cfg, "title", "STEM"), width, height)
+  cocoaSetAssocKey(app, "stem.win", win)
+  let fontFamily = cfgAlias(cfg, "font_family", "font", "JetBrainsMono Nerd Font Mono")
+  let mono = cocoaFontFamily(cocoaMonoFont(toInt(cfgVal(cfg, "font_size", "13"))), fontFamily)
+  let fg = cfgRGBAlias(cfg, "foreground", "fg", 216, 218, 212)
+  let bg = stemSetOpacity(win, cfgRGBAlias(cfg, "background", "bg", 5, 7, 12), cfgVal(cfg, "opacity", "0.80"))
+  cocoaSetAssocKey(app, "stem.mono", mono)
+  cocoaSetAssocKey(app, "stem.fontsize", cocoaNumber(toInt(cfgVal(cfg, "font_size", "13"))))
+  cocoaSetAssocKey(app, "stem.fontfam", nsString(fontFamily))
+  cocoaSetAssocKey(app, "stem.fgc", fg)
+  cocoaSetAssocKey(app, "stem.bgc", bg)
+  if cfgBool(cfg, "text_shadow", 1) == 1 {
+    let shadow = msg(msg(cls("NSShadow"), "alloc"), "init")
+    let shadowColor = msg_timer(cocoaRGB(0, 0, 0), "colorWithAlphaComponent:", 900, 0, "", 0, 0)
+    msg_1(shadow, "setShadowColor:", shadowColor)
+    msg_frame(shadow, "setShadowOffset:", 0, 0, 0, 0)
+    msg_timer(shadow, "setShadowBlurRadius:", toInt(cfgVal(cfg, "text_shadow_blur", "1")) * 1000, 0, "", 0, 0)
+    cocoaSetAssocKey(app, "stem.textshadow", shadow)
+  }
+  cocoaSetAssocKey(app, "stem.cursorstyle", nsString(cfgVal(cfg, "cursor_style", "bar")))
+  cocoaSetAssocKey(app, "stem.cursorcolor", cfgRGB(cfg, "cursor_color", 139, 92, 246))
+  cocoaSetAssocKey(app, "stem.padding", cocoaNumber(toInt(cfgVal(cfg, "padding", "8"))))
+  cocoaSetAssocKey(app, "stem.panegap", cocoaNumber(toInt(cfgVal(cfg, "pane_gap", "2"))))
+  cocoaSetAssocKey(app, "stem.scrollbar", cocoaNumber(cfgBool(cfg, "scrollbar", 1)))
+  cocoaSetAssocKey(app, "stem.w", cocoaNumber(width))
+  cocoaSetAssocKey(app, "stem.h", cocoaNumber(height))
+  cocoaSetAssocKey(app, "stem.cols", cocoaNumber(cols))
+  cocoaSetAssocKey(app, "stem.rows", cocoaNumber(rows))
+  cocoaSetAssocKey(app, "stem.pendingw", cocoaNumber(width))
+  cocoaSetAssocKey(app, "stem.pendingh", cocoaNumber(height))
+  cocoaSetAssocKey(app, "stem.resizewait", cocoaNumber(0))
+  cocoaSetAssocKey(app, "stem.cellw1000", cocoaNumber(((width - 320 - toInt(cfgVal(cfg, "padding", "8")) * 2) * 1000) / cols))
+  cocoaSetAssocKey(app, "stem.cellh1000", cocoaNumber(((height - 236 - toInt(cfgVal(cfg, "padding", "8")) * 2) * 1000) / rows))
+  cocoaSetAssocKey(app, "stem.shell", nsString(shell))
+  cocoaSetAssocKey(app, "stem.tree", mkLeaf(0))
+  cocoaSetWindowMinSize(win, toInt(cfgVal(cfg, "minimum_width", "480")), toInt(cfgVal(cfg, "minimum_height", "280")))
+  msg_1(win, "setTitlebarAppearsTransparent:", cfgBool(cfg, "titlebar_transparent", 1))
+  msg_1(win, "setHasShadow:", cfgBool(cfg, "window_shadow", 1))
+  if cfgBool(cfg, "always_on_top", 0) == 1 { msg_1(win, "setLevel:", 3) }
+  if cfgBool(cfg, "center_on_launch", 1) == 1 { msg(win, "center") }
+  let appearance = toLower(cfgVal(cfg, "appearance", "dark"))
+  if appearance == "dark" { msg_1(win, "setAppearance:", msg_1(cls("NSAppearance"), "appearanceNamed:", nsString("NSAppearanceNameDarkAqua"))) }
+  if appearance == "light" { msg_1(win, "setAppearance:", msg_1(cls("NSAppearance"), "appearanceNamed:", nsString("NSAppearanceNameAqua"))) }
+  cocoaSetAssocKey(app, "stem.pmasters", cocoaArray())
+  cocoaSetAssocKey(app, "stem.pbacks", cocoaArray())
+  cocoaSetAssocKey(app, "stem.pscrolls", cocoaArray())
+  cocoaSetAssocKey(app, "stem.pviews", cocoaArray())
+  cocoaSetAssocKey(app, "stem.pdocs", cocoaArray())
+  cocoaSetAssocKey(app, "stem.pcols", cocoaArray())
+  cocoaSetAssocKey(app, "stem.prows", cocoaArray())
+  cocoaSetAssocKey(app, "stem.pkviews", cocoaArray())
+  // all 4 panes created + warm; only pane 0 shown until split
+  let pad = toInt(cfgVal(cfg, "padding", "8"))
+  stemPaintChrome(win, width, height, pad)
+  let kview = stemMakePaneView(m0, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 236 - pad * 2, cols, rows)
+  let kv1 = stemMakePaneView(m1, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 236 - pad * 2, cols, rows)
+  let kv2 = stemMakePaneView(m2, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 236 - pad * 2, cols, rows)
+  let kv3 = stemMakePaneView(m3, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 236 - pad * 2, cols, rows)
+  let pscrolls = cocoaGetAssocKey(app, "stem.pscrolls")
+  let pkviews = cocoaGetAssocKey(app, "stem.pkviews")
+  let pbacks = cocoaGetAssocKey(app, "stem.pbacks")
+  let hi = 1
+  while hi < 4 {
+    msg_1(cocoaArrayGet(pscrolls, hi), "setHidden:", 1)
+    msg_1(cocoaArrayGet(pkviews, hi), "setHidden:", 1)
+    msg_1(cocoaArrayGet(pbacks, hi), "setHidden:", 1)
+    hi = hi + 1
+  }
+  cocoaSetAssocKey(app, "stem.master", cocoaNumber(m0))
+  cocoaSetAssocKey(app, "stem.focus", kview)
+  let windowDelegate = cocoaNew(stemWindowDelegateClass())
+  cocoaSetAssocKey(app, "stem.windelegate", windowDelegate)
+  msg_1(win, "setDelegate:", windowDelegate)
+  ksBuildWorkbench(win, width, height)
+  cocoaShow(win, app)
+  if cfgBool(cfg, "start_fullscreen", 0) == 1 { msg_1(win, "toggleFullScreen:", 0) }
+  cocoaMakeFirstResponder(win, kview)
+  cocoaFinishLaunching(app)
+  // make the app frontmost/key on launch — a manual-event-loop app isn't
+  // activated automatically, so the window's text view doesn't draw until it
+  // becomes key (was: blank prompt until reopened from the dock).
+  msg_1(app, "activateIgnoringOtherApps:", 1)
+  msg_1(win, "makeKeyAndOrderFront:", 0)
+
+  // manual loop: up to 2 panes; grid state kept in locals (packed != UTF-8)
+  let st0 = gridNew(cols, rows)
+  let pend0 = ""
+  let st1 = ""
+  let pend1 = ""
+  let st2 = ""
+  let pend2 = ""
+  let st3 = ""
+  let pend3 = ""
+  let p1init = 0
+  let p2init = 0
+  let p3init = 0
+  let cursorBlinkMs = toInt(cfgVal(cfg, "cursor_blink_ms", "530"))
+  let cursorBlinkTicks = cursorBlinkMs / 8
+  if cursorBlinkTicks < 1 { cursorBlinkTicks = 1 }
+  let cursorOn = 1
+  let lastCursorOn = 1
+  let i = 0
+  while i < 2000000000 {
+    cocoaPumpEvents(app)
+    if i - (i / 30) * 30 == 0 { ksPoll() }
+    if ksNumber("resetgrid") == 1 {
+      ksSet("resetgrid", cocoaNumber(0))
+      st0 = gridNew(cocoaNumberVal(cocoaArrayGet(cocoaGetAssocKey(app, "stem.pcols"), 0)), cocoaNumberVal(cocoaArrayGet(cocoaGetAssocKey(app, "stem.prows"), 0)))
+      pend0 = ""
+    }
+    // cocoaPumpEvents can dispatch the main window's close event. Stop before
+    // touching its views again: AppKit may already have released their native
+    // backing objects even though our associated pointers still exist.
+    if msg(win, "isVisible") == 0 {
+      fdClose(m0)
+      fdClose(m1)
+      fdClose(m2)
+      fdClose(m3)
+      msg_1(app, "terminate:", app)
+      exit("0")
+    }
+    let masters = cocoaGetAssocKey(app, "stem.pmasters")
+    let pviews = cocoaGetAssocKey(app, "stem.pviews")
+    let pdocs = cocoaGetAssocKey(app, "stem.pdocs")
+    let pcolsA = cocoaGetAssocKey(app, "stem.pcols")
+    let prowsA = cocoaGetAssocKey(app, "stem.prows")
+    let pc = cocoaArrayCount(masters)
+    cursorOn = 1
+    if cursorBlinkMs > 0 {
+      if (i / cursorBlinkTicks) - ((i / cursorBlinkTicks) / 2) * 2 == 1 { cursorOn = 0 }
+    }
+    // re-assert activation once the event pump is running (first call before the
+    // pump may not take) so the window becomes key + the text view draws.
+    if i == 5 {
+      msg_1(app, "activateIgnoringOtherApps:", 1)
+      msg_1(cocoaGetAssocKey(app, "stem.win"), "makeKeyAndOrderFront:", 0)
+    }
+    // AppKit autoresizes the views immediately; keep the PTY and terminal grid
+    // in lockstep. Polling every four ticks avoids resize-drag churn.
+    stemSyncWindowSize()
+    if brainFlagS("stem.splitdirty", 0) == 1 {
+      cocoaSetAssocKey(app, "stem.splitdirty", cocoaNumber(0))
+      st0 = gridNew(cocoaNumberVal(cocoaArrayGet(pcolsA, 0)), cocoaNumberVal(cocoaArrayGet(prowsA, 0)))  pend0 = ""
+      p1init = 0  p2init = 0  p3init = 0
+    }
+    let c0 = cocoaNumberVal(cocoaArrayGet(pcolsA, 0))
+    let r0 = cocoaNumberVal(cocoaArrayGet(prowsA, 0))
+    let chunk0 = fdRead(cocoaNumberVal(cocoaArrayGet(masters, 0)), 4096)
+    if len(chunk0) > 0 {
+      let buf = pend0 + chunk0
+      let safe = gridSafeLen(buf)
+      pend0 = substring(buf, safe, len(buf))
+      st0 = gridFeed(st0, substring(buf, 0, safe), c0, r0)
+      let curp = gridCursor(st0, c0, r0)
+      let ci2 = indexOf(curp, ",")
+      let rendered = gridRender(st0, c0, r0)
+      cocoaSetAssocKey(app, "stem.lastrender", nsString(rendered))
+      msg_1(cocoaArrayGet(pviews, 0), "setAttributedString:", renderSnapshot(rendered, fg, cocoaGetAssocKey(app, "stem.mono"), toInt(substring(curp, 0, ci2)), toInt(substring(curp, ci2 + 1, len(curp))), cursorOn))
+    }
+    // On a COLD first launch the login shell + p10k can take >5s to draw the
+    // prompt; an idle prompt then sends no output to trigger a view repaint, so
+    // it stays blank until the window is re-focused. Repaint pane 0 every ~0.25s
+    // for the first ~25s (Cocoa-side only) so the prompt appears as soon as it
+    // lands, no matter how slow the cold start.
+    if i < 3000 { if i - (i / 30) * 30 == 0 {
+      let cp = gridCursor(st0, c0, r0)
+      let ck = indexOf(cp, ",")
+      msg_1(cocoaArrayGet(pviews, 0), "setAttributedString:", renderSnapshot(gridRender(st0, c0, r0), fg, cocoaGetAssocKey(app, "stem.mono"), toInt(substring(cp, 0, ck)), toInt(substring(cp, ck + 1, len(cp))), cursorOn))
+      // force the deferred draw (what a dock re-focus does): mark dirty + display
+      msg_1(cocoaArrayGet(pdocs, 0), "setNeedsDisplay:", 1)
+      msg(cocoaArrayGet(pdocs, 0), "display")
+      msg(cocoaGetAssocKey(app, "stem.win"), "displayIfNeeded")
+    } }
+    if pc >= 2 {
+      let c1 = cocoaNumberVal(cocoaArrayGet(pcolsA, 1))
+      let r1 = cocoaNumberVal(cocoaArrayGet(prowsA, 1))
+      if p1init == 0 { st1 = gridNew(c1, r1)  pend1 = ""  p1init = 1 }
+      let chunk1 = fdRead(cocoaNumberVal(cocoaArrayGet(masters, 1)), 4096)
+      if len(chunk1) > 0 {
+        let buf1 = pend1 + chunk1
+        let safe1 = gridSafeLen(buf1)
+        pend1 = substring(buf1, safe1, len(buf1))
+        st1 = gridFeed(st1, substring(buf1, 0, safe1), c1, r1)
+        let curp1 = gridCursor(st1, c1, r1)
+        let cj = indexOf(curp1, ",")
+        msg_1(cocoaArrayGet(pviews, 1), "setAttributedString:", renderSnapshot(gridRender(st1, c1, r1), fg, cocoaGetAssocKey(app, "stem.mono"), toInt(substring(curp1, 0, cj)), toInt(substring(curp1, cj + 1, len(curp1))), cursorOn))
+      }
+    }
+    if pc >= 3 {
+      let c2 = cocoaNumberVal(cocoaArrayGet(pcolsA, 2))
+      let r2 = cocoaNumberVal(cocoaArrayGet(prowsA, 2))
+      if p2init == 0 { st2 = gridNew(c2, r2)  pend2 = ""  p2init = 1 }
+      let chunk2 = fdRead(cocoaNumberVal(cocoaArrayGet(masters, 2)), 4096)
+      if len(chunk2) > 0 {
+        let buf2 = pend2 + chunk2
+        let safe2 = gridSafeLen(buf2)
+        pend2 = substring(buf2, safe2, len(buf2))
+        st2 = gridFeed(st2, substring(buf2, 0, safe2), c2, r2)
+        let curp2 = gridCursor(st2, c2, r2)
+        let ck = indexOf(curp2, ",")
+        msg_1(cocoaArrayGet(pviews, 2), "setAttributedString:", renderSnapshot(gridRender(st2, c2, r2), fg, cocoaGetAssocKey(app, "stem.mono"), toInt(substring(curp2, 0, ck)), toInt(substring(curp2, ck + 1, len(curp2))), cursorOn))
+      }
+    }
+    if pc >= 4 {
+      let c3 = cocoaNumberVal(cocoaArrayGet(pcolsA, 3))
+      let r3 = cocoaNumberVal(cocoaArrayGet(prowsA, 3))
+      if p3init == 0 { st3 = gridNew(c3, r3)  pend3 = ""  p3init = 1 }
+      let chunk3 = fdRead(cocoaNumberVal(cocoaArrayGet(masters, 3)), 4096)
+      if len(chunk3) > 0 {
+        let buf3 = pend3 + chunk3
+        let safe3 = gridSafeLen(buf3)
+        pend3 = substring(buf3, safe3, len(buf3))
+        st3 = gridFeed(st3, substring(buf3, 0, safe3), c3, r3)
+        let curp3 = gridCursor(st3, c3, r3)
+        let cl = indexOf(curp3, ",")
+        msg_1(cocoaArrayGet(pviews, 3), "setAttributedString:", renderSnapshot(gridRender(st3, c3, r3), fg, cocoaGetAssocKey(app, "stem.mono"), toInt(substring(curp3, 0, cl)), toInt(substring(curp3, cl + 1, len(curp3))), cursorOn))
+      }
+    }
+    if cursorOn != lastCursorOn {
+      stemRepaintCursor(st0, 0, c0, r0, fg, cursorOn)
+      if pc >= 2 { if p1init == 1 { stemRepaintCursor(st1, 1, cocoaNumberVal(cocoaArrayGet(pcolsA, 1)), cocoaNumberVal(cocoaArrayGet(prowsA, 1)), fg, cursorOn) } }
+      if pc >= 3 { if p2init == 1 { stemRepaintCursor(st2, 2, cocoaNumberVal(cocoaArrayGet(pcolsA, 2)), cocoaNumberVal(cocoaArrayGet(prowsA, 2)), fg, cursorOn) } }
+      if pc >= 4 { if p3init == 1 { stemRepaintCursor(st3, 3, cocoaNumberVal(cocoaArrayGet(pcolsA, 3)), cocoaNumberVal(cocoaArrayGet(prowsA, 3)), fg, cursorOn) } }
+      lastCursorOn = cursorOn
+    }
+    sleepUs(0, 8000)
+    i = i + 1
+  }
+}

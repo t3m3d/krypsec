@@ -1,0 +1,55 @@
+nmap|Network|nmap|nmap|Network discovery and service inspection|--help
+masscan|Network|masscan|masscan|High-speed network port scanner|--help
+rustscan|Network|rustscan|rustscan|Fast port discovery|--help
+netcat|Network|nc||TCP and UDP connection diagnostics|-h
+socat|Network|socat|socat|Socket relay and network diagnostics|-h
+tcpdump|Network|tcpdump||Packet capture; capture may require privileges|--help
+tshark|Network|tshark|wireshark|Wireshark command-line packet analysis|--help
+aircrack-ng|Wireless|aircrack-ng|aircrack-ng|Wireless capture analysis; macOS capture support varies|--help
+mtr|Network|mtr|mtr|Route and connectivity diagnostics|--help
+iperf3|Network|iperf3|iperf3|Network throughput measurement|--help
+dig|DNS|dig||DNS record lookup|-h
+doggo|DNS|doggo|doggo|DNS lookup and diagnostics|--help
+dnsx|DNS|dnsx|dnsx|DNS resolution toolkit|-h
+subfinder|DNS|subfinder|subfinder|Passive subdomain discovery|-h
+amass|DNS|amass|amass|Attack surface and asset discovery|-help
+httpx|Web|httpx|httpx|ProjectDiscovery HTTP probing; verify executable identity|-h
+nuclei|Web|nuclei|nuclei|Template-based vulnerability checks|-h
+nikto|Web|nikto|nikto|Web server security checks|-Help
+sqlmap|Web|sqlmap|sqlmap|SQL injection testing|-h
+ffuf|Web|ffuf|ffuf|HTTP content discovery and fuzzing|-h
+gobuster|Web|gobuster|gobuster|Web content and DNS discovery|--help
+feroxbuster|Web|feroxbuster|feroxbuster|Recursive web content discovery|--help
+testssl|Web|testssl.sh|testssl|TLS configuration and cipher assessment|--help
+curl|Web|curl||HTTP and TLS diagnostics|--help
+wget|Web|wget|wget|HTTP download and inspection|--help
+openssl|Crypto|openssl|openssl@3|TLS certificates and cryptographic utilities|help
+gnupg|Crypto|gpg|gnupg|OpenPGP encryption and signatures|--help
+age|Crypto|age|age|File encryption|--help
+hashcat|Passwords|hashcat|hashcat|Password hash recovery; hardware support varies|--help
+john|Passwords|john|john-jumbo|John the Ripper password auditing|--list=help
+hydra|Passwords|hydra|hydra|Authentication auditing|-h
+crunch|Passwords|crunch|crunch|Wordlist generation|-h
+yara|Forensics|yara|yara|Rule-based file and malware analysis|--help
+sleuthkit|Forensics|fls|sleuthkit|Filesystem forensic investigation|-h
+exiftool|Forensics|exiftool|exiftool|File metadata inspection|-h
+binwalk|Forensics|binwalk|binwalk|Firmware and binary inspection|--help
+radare2|Forensics|r2|radare2|Interactive reverse engineering|-h
+ripgrep|Forensics|rg|ripgrep|Fast evidence and log searching|--help
+jq|Forensics|jq|jq|JSON log processing|--help
+file|Forensics|file||File type identification|--help
+strings|Forensics|strings||Extract printable strings from binaries|-h
+trivy|Code & cloud|trivy|trivy|Container and filesystem vulnerability scanning|--help
+grype|Code & cloud|grype|grype|Software vulnerability scanning|--help
+syft|Code & cloud|syft|syft|Software bill of materials generation|--help
+gitleaks|Code & cloud|gitleaks|gitleaks|Repository secret detection|--help
+trufflehog|Code & cloud|trufflehog|trufflehog|Secret discovery|--help
+semgrep|Code & cloud|semgrep|semgrep|Static code analysis|--help
+checkov|Code & cloud|checkov|checkov|Infrastructure-as-code security checks|--help
+osquery|macOS|osqueryi|cask:osquery|SQL-based operating system inspection|--help
+lsof|macOS|lsof||Open files and connection inspection|-h
+codesign|macOS|codesign||Inspect macOS code signatures|-h
+spctl|macOS|spctl||Gatekeeper assessment|--help
+security|macOS|security||macOS keychain and certificate utilities|help
+log|macOS|log||macOS unified log investigation|help
+ssh|Network|ssh||Secure shell client|-?

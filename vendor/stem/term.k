@@ -1,0 +1,1122 @@
+// term.k — stem grid driver (pure Krypton terminal core, phase 4).
+//
+// Maintains a rows×cols cell grid with a cursor and ACTS on the common VT
+// sequences — cursor positioning (CUP/CUU/CUD/CUF/CUB), erase (ED/EL), CR/LF/
+// BS/TAB, SGR fg+bg colour, scroll-on-overflow — then renders the grid back to
+// text (re-emitting ANSI colour). Krypton port of brain/terk's Grid + applyEscape.
+//
+// Two representations of state:
+//   - one-shot:    renderGrid(s, cols, rows)            -> text
+//   - incremental: gridNew(cols,rows) -> state          (a packed string)
+//                  gridFeed(state, bytes, cols, rows)   -> state
+//                  gridRender(state, cols, rows)        -> text
+// The interactive loop keeps `state` across frames and feeds only the new bytes,
+// so it never re-processes the whole stream (renderGrid is O(input×gridsize)).
+//
+// The CHARACTER grid uses 5-byte slots per cell: [width][b0][b1][b2][b3], width
+// 1-4 = how many following bytes are the cell's UTF-8 character (rest SOH-padded)
+// — so a multi-byte glyph occupies one display column. `attr` (fg) and `battr`
+// (bg) grids are 1 byte/cell (SGR colour code, sentinel 1 = default). The packed
+// state string is grid+attr+battr+"|"+cr+","+cc+","+pen. Every byte is non-NUL
+// (widths 1-4, SOH pad, colour codes >=30, UTF-8 >=0x20, header is ASCII). Uses
+// only charCode/substring/len/sbAppend/fromCharCode — verified native builtins
+// (k:map is broken on macho). No C, no FFI, no maps.
+
+module stem_term
+
+// _isLetter(code) — CSI final byte is an ASCII letter.
+func _isLetter(c) {
+    emit (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+// a CSI final byte is 0x40..0x7E — letters PLUS @ ` ~ { etc. (ICH '@', HPA '`', …)
+func _isCsiFinal(c) { if c >= 64 && c <= 126 { emit 1 }  emit 0 }
+
+// _leadInt(s, def) — leading non-negative integer in s; `def` if none.
+func _leadInt(s, def) {
+    let n = len(s)
+    let i = 0
+    let v = 0
+    let any = 0
+    while i < n {
+        let c = charCode(substring(s, i, i + 1))
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48)  any = 1  i = i + 1 }
+        else { i = n }
+    }
+    if any == 0 { emit def }
+    emit v
+}
+
+// _afterSemi(s) — substring after the first ';' (empty if none). For ESC[r;cH.
+func _afterSemi(s) {
+    let n = len(s)
+    let i = 0
+    while i < n {
+        if charCode(substring(s, i, i + 1)) == 59 { emit substring(s, i + 1, n) }
+        i = i + 1
+    }
+    emit ""
+}
+
+// _clamp(v, lo, hi)
+func _clamp(v, lo, hi) {
+    if v < lo { emit lo }
+    if v > hi { emit hi }
+    emit v
+}
+
+// _cf(s, k) — the k-th comma-separated non-negative integer field of s (0 if none).
+func _cf(s, k) {
+    let n = len(s)
+    let i = 0
+    let field = 0
+    let v = 0
+    while i < n {
+        let c = charCode(substring(s, i, i + 1))
+        if c == 44 { if field == k { emit v }  field = field + 1  v = 0 }
+        else { if c >= 48 && c <= 57 { v = v * 10 + (c - 48) } }
+        i = i + 1
+    }
+    if field == k { emit v }
+    emit 0
+}
+
+// _fill1(size) — a string of `size` SOH bytes (the default-colour sentinel).
+func _fill1(size) {
+    let sb = sbNew()
+    let one = fromCharCode(1)
+    let i = 0
+    while i < size { sb = sbAppend(sb, one)  i = i + 1 }
+    emit sbToString(sb)
+}
+
+// _cellBlank() — one blank char-grid slot: width 1, a space, 3 SOH pad bytes.
+func _cellBlank() {
+    emit fromCharCode(1) + " " + fromCharCode(1) + fromCharCode(1) + fromCharCode(1)
+}
+
+// _blankRow(cols) — `cols` blank char-grid slots (cols*5 bytes).
+func _blankRow(cols) {
+    let sb = sbNew()
+    let b = _cellBlank()
+    let i = 0
+    while i < cols { sb = sbAppend(sb, b)  i = i + 1 }
+    emit sbToString(sb)
+}
+
+// _putCell(g, cellIdx, chstr) — store the (1-4 byte) UTF-8 char in slot cellIdx.
+func _putCell(g, cellIdx, chstr) {
+    let w = len(chstr)
+    let pad = ""
+    let k = w
+    while k < 4 { pad = pad + fromCharCode(1)  k = k + 1 }
+    let off = cellIdx * 5
+    emit substring(g, 0, off) + fromCharCode(w) + chstr + pad + substring(g, off + 5, len(g))
+}
+
+// _put1(g, idx, ch) — replace the 1-byte cell at idx (attr/battr grids).
+func _put1(g, idx, ch) {
+    emit substring(g, 0, idx) + ch + substring(g, idx + 1, len(g))
+}
+
+// _scrollUp(g, stride, gtotal, fillRow) — drop the top row, append a fresh
+// bottom row (generic over byte-stride: char grid = cols*5, attr = cols).
+func _scrollUp(g, stride, gtotal, fillRow) {
+    emit substring(g, stride, gtotal) + fillRow
+}
+
+// ── buffer-backed plane ops (gridFeed mutates buffers in place; the old string
+// splice rebuilt the whole ~50KB grid PER CHARACTER -> OOM under output). ───────
+func _sToBuf(s) {
+    let n = len(s)
+    let b = bufNew(n)
+    let i = 0
+    while i < n { bufSetByte(b, i, toInt(charCode(substring(s, i, i + 1))))  i = i + 1 }
+    emit b
+}
+func _bufToS(b, n) {
+    let sb = sbNew()
+    let i = 0
+    while i < n { sb = sbAppend(sb, fromCharCode(toInt(bufGetByte(b, i))))  i = i + 1 }
+    emit sbToString(sb)
+}
+func _loadBuf(b, s, srcOff, n) {        // copy n bytes from s[srcOff:] into buffer b (in place)
+    let i = 0
+    while i < n { bufSetByte(b, i, toInt(charCode(substring(s, srcOff + i, srcOff + i + 1))))  i = i + 1 }
+    emit 0
+}
+func _putCellB(gb, cellIdx, chstr) {
+    let w = len(chstr)
+    let off = cellIdx * 5
+    bufSetByte(gb, off, w)
+    let k = 0
+    while k < w { bufSetByte(gb, off + 1 + k, toInt(charCode(substring(chstr, k, k + 1))))  k = k + 1 }
+    while k < 4 { bufSetByte(gb, off + 1 + k, 1)  k = k + 1 }
+    emit 0
+}
+func _blankCellsB(gb, startCell, count) {       // blank `count` grid cells (width 1, space)
+    let c = 0
+    while c < count {
+        let off = (startCell + c) * 5
+        bufSetByte(gb, off, 1)  bufSetByte(gb, off + 1, 32)
+        bufSetByte(gb, off + 2, 1)  bufSetByte(gb, off + 3, 1)  bufSetByte(gb, off + 4, 1)
+        c = c + 1
+    }
+    emit 0
+}
+func _fillB(b, start, count, v) {               // fill `count` attr/battr bytes with v
+    let c = 0
+    while c < count { bufSetByte(b, start + c, v)  c = c + 1 }
+    emit 0
+}
+func _scrollBytesB(b, rowBytes, totalBytes) {   // shift everything up one row (caller fills last row)
+    let i = rowBytes
+    while i < totalBytes { bufSetByte(b, i - rowBytes, toInt(bufGetByte(b, i)))  i = i + 1 }
+    emit 0
+}
+// scroll one byte-plane within rows [top..bot] up by one (DECSTBM region); blank
+// row bot. rowBytes = bytes per cell-row (cols*5 for grid, cols for attr planes).
+func _scrollRegionBytesB(b, top, bot, rowBytes, fillIsBlank, cols) {
+    let r = top
+    while r < bot {
+        let dst = r * rowBytes
+        let src = dst + rowBytes
+        let j = 0
+        while j < rowBytes { bufSetByte(b, dst + j, toInt(bufGetByte(b, src + j)))  j = j + 1 }
+        r = r + 1
+    }
+    emit 0
+}
+// scroll rows [top..bot] DOWN one (for RI / IL); caller blanks row top.
+func _scrollRegionDownB(b, top, bot, rowBytes) {
+    let r = bot
+    while r > top {
+        let dst = r * rowBytes
+        let src = dst - rowBytes
+        let j = 0
+        while j < rowBytes { bufSetByte(b, dst + j, toInt(bufGetByte(b, src + j)))  j = j + 1 }
+        r = r - 1
+    }
+    emit 0
+}
+// blank one cell-row (all 4 planes) at row r — shared by region down/up edges.
+func _blankFullRowB(gb, ab, bb, ub, r, cols) {
+    _blankCellsB(gb, r * cols, cols)  _fillB(ab, r * cols, cols, 1)
+    _fillB(bb, r * cols, cols, 1)  _fillB(ub, r * cols, cols, 0)
+    emit 0
+}
+func _cellMoveB(gb, ab, bb, ub, dstCell, srcCell) {   // copy one cell (all 4 planes)
+    let d = dstCell * 5  let s = srcCell * 5
+    bufSetByte(gb, d, toInt(bufGetByte(gb, s)))      bufSetByte(gb, d + 1, toInt(bufGetByte(gb, s + 1)))
+    bufSetByte(gb, d + 2, toInt(bufGetByte(gb, s + 2)))  bufSetByte(gb, d + 3, toInt(bufGetByte(gb, s + 3)))
+    bufSetByte(gb, d + 4, toInt(bufGetByte(gb, s + 4)))
+    bufSetByte(ab, dstCell, toInt(bufGetByte(ab, srcCell)))
+    bufSetByte(bb, dstCell, toInt(bufGetByte(bb, srcCell)))
+    bufSetByte(ub, dstCell, toInt(bufGetByte(ub, srcCell)))
+    emit 0
+}
+// ICH: insert n blanks at (row,col), shifting the rest of the line right (off the edge).
+func _rowInsertB(gb, ab, bb, ub, row, col, n, cols) {
+    let base = row * cols
+    let c = cols - 1
+    while c >= col + n { _cellMoveB(gb, ab, bb, ub, base + c, base + c - n)  c = c - 1 }
+    let bn = n  if col + bn > cols { bn = cols - col }
+    _blankCellsB(gb, base + col, bn)  _fillB(ab, base + col, bn, 1)  _fillB(bb, base + col, bn, 1)  _fillB(ub, base + col, bn, 0)
+    emit 0
+}
+// DCH: delete n chars at (row,col), shifting the rest left; blank the line tail.
+func _rowDeleteB(gb, ab, bb, ub, row, col, n, cols) {
+    let base = row * cols
+    let c = col
+    while c + n < cols { _cellMoveB(gb, ab, bb, ub, base + c, base + c + n)  c = c + 1 }
+    let bs = cols - n  if bs < col { bs = col }
+    _blankCellsB(gb, base + bs, cols - bs)  _fillB(ab, base + bs, cols - bs, 1)  _fillB(bb, base + bs, cols - bs, 1)  _fillB(ub, base + bs, cols - bs, 0)
+    emit 0
+}
+func _renderRowB(gb, ab, bb, base, cols) {       // one cell-row -> text, from buffers (for scrolled)
+    let e = cols
+    let trimming = 1
+    while e > 0 && trimming == 1 {
+        let off = (base + e - 1) * 5
+        if toInt(bufGetByte(gb, off)) == 1 && toInt(bufGetByte(gb, off + 1)) == 32 { e = e - 1 }
+        else { trimming = 0 }
+    }
+    let out = sbNew()
+    let lastFg = 1  let lastBg = 1
+    let col = 0
+    while col < e {
+        let cellFg = toInt(bufGetByte(ab, base + col))
+        let cellBg = toInt(bufGetByte(bb, base + col))
+        if cellFg != lastFg || cellBg != lastBg {
+            out = sbAppend(out, _sgrPair(cellFg, cellBg))
+            lastFg = cellFg  lastBg = cellBg
+        }
+        let off = (base + col) * 5
+        let w = toInt(bufGetByte(gb, off))
+        let k = 0
+        while k < w { out = sbAppend(out, fromCharCode(toInt(bufGetByte(gb, off + 1 + k))))  k = k + 1 }
+        col = col + 1
+    }
+    if lastFg != 1 || lastBg != 1 { out = sbAppend(out, fromCharCode(27) + "[0m") }
+    emit sbToString(out)
+}
+
+// _applySgr(pen, params) — fold an SGR list (e.g. "1;31;44") into the colour pen
+// (fg*256+bg, sentinel 1 each): fg 30-37/39/90-97, bg 40-47/49/100-107.
+// _lvl(v) — an 8-bit channel -> nearest xterm-256 cube level (0-5).
+func _lvl(v) {
+    if v < 48 { emit 0 }
+    if v < 115 { emit 1 }
+    if v < 155 { emit 2 }
+    if v < 195 { emit 3 }
+    if v < 235 { emit 4 }
+    emit 5
+}
+// _rgb256(r,g,b) — nearest xterm-256 colour-cube index (16-231). Truecolor
+// (38;2/48;2) is folded to 256 so it fits the 1-byte-per-cell colour model.
+func _rgb256(r, g, b) {
+    emit 16 + 36 * _lvl(r) + 6 * _lvl(g) + _lvl(b)
+}
+
+func _applySgr(pen, params) {
+    let n = len(params)
+    if n == 0 { emit 257 }
+    let ul = pen / 131072            // underline flag (pen bit 17)
+    let rev = (pen - ul * 131072) / 65536   // reverse-video flag (pen bit 16)
+    let base = pen - ul * 131072 - rev * 65536
+    let fg = base / 256
+    let bg = base - fg * 256
+    let i = 0
+    let cur = 0
+    let any = 0
+    // fg/bg encoded as a 256-colour index: 1 = default, 2..255 = index 0..253.
+    // stage drives the 38;5;N / 48;5;N (256) and 38;2;r;g;b / 48;2;r;g;b (true-
+    // colour) sub-sequences. tr/tg hold r,g while collecting a truecolor triple.
+    let stage = 0    // 0 norm; 1 got38; 2 got38;5; 3 got48; 4 got48;5;
+                     // 5/6/7 = 38;2 r/g/b ; 8/9/10 = 48;2 r/g/b
+    let tr = 0
+    let tg = 0
+    let bold = 0     // SGR 1 in this sequence -> promote a standard fg to bright
+    while i <= n {
+        let sep = 0
+        if i == n { sep = 1 }
+        else { if charCode(substring(params, i, i + 1)) == 59 { sep = 1 } }
+        if sep == 1 {
+            if any == 1 {
+                if stage == 2 { let x = cur  if x > 253 { x = 253 }  fg = x + 2  stage = 0 }
+                else { if stage == 4 { let x = cur  if x > 253 { x = 253 }  bg = x + 2  stage = 0 }
+                else { if stage == 5 { tr = cur  stage = 6 }
+                else { if stage == 6 { tg = cur  stage = 7 }
+                else { if stage == 7 { let x = _rgb256(tr, tg, cur)  if x > 253 { x = 253 }  fg = x + 2  stage = 0 }
+                else { if stage == 8 { tr = cur  stage = 9 }
+                else { if stage == 9 { tg = cur  stage = 10 }
+                else { if stage == 10 { let x = _rgb256(tr, tg, cur)  if x > 253 { x = 253 }  bg = x + 2  stage = 0 }
+                else { if stage == 1 { if cur == 5 { stage = 2 } else { if cur == 2 { stage = 5 } else { stage = 0 } } }
+                else { if stage == 3 { if cur == 5 { stage = 4 } else { if cur == 2 { stage = 8 } else { stage = 0 } } }
+                else {
+                    if cur == 0 { fg = 1  bg = 1  bold = 0  rev = 0  ul = 0 }
+                    if cur == 1 { bold = 1 }                         // bold/bright
+                    if cur == 22 { bold = 0 }                        // normal intensity
+                    if cur == 4 { ul = 1 }                           // underline on
+                    if cur == 24 { ul = 0 }                          // underline off
+                    if cur == 7 { rev = 1 }                          // reverse video on
+                    if cur == 27 { rev = 0 }                         // reverse video off
+                    if cur == 38 { stage = 1 }
+                    if cur == 48 { stage = 3 }
+                    if cur == 39 { fg = 1 }
+                    if cur >= 30 && cur <= 37 { fg = cur - 28 }      // index 0-7
+                    if cur >= 90 && cur <= 97 { fg = cur - 80 }      // index 8-15
+                    if cur == 49 { bg = 1 }
+                    if cur >= 40 && cur <= 47 { bg = cur - 38 }      // index 0-7
+                    if cur >= 100 && cur <= 107 { bg = cur - 90 }    // index 8-15
+                } } } } } } } } } }
+            }
+            cur = 0
+            any = 0
+        } else {
+            let c = charCode(substring(params, i, i + 1))
+            if c >= 48 && c <= 57 { cur = cur * 10 + (c - 48)  any = 1 }
+        }
+        i = i + 1
+    }
+    if bold == 1 && fg >= 2 && fg <= 9 { fg = fg + 8 }   // standard fg 0-7 -> bright 8-15
+    emit ul * 131072 + rev * 65536 + fg * 256 + bg
+}
+
+// _sgrPair(fg, bg) — ANSI to set (fg,bg); 1 = default, else 256-colour index+2.
+// Re-emitted as 256-colour so the shim renders the exact palette. Reset-then-set.
+func _sgrPair(fg, bg) {
+    let e = fromCharCode(27)
+    let s = e + "[0m"
+    if fg != 1 { s = s + e + "[38;5;" + (fg - 2) + "m" }
+    if bg != 1 { s = s + e + "[48;5;" + (bg - 2) + "m" }
+    emit s
+}
+
+// _utf8Len(c) — byte length of a UTF-8 char from its lead byte (1 if invalid).
+func _utf8Len(c) {
+    if c >= 240 && c <= 247 { emit 4 }
+    if c >= 224 && c <= 239 { emit 3 }
+    if c >= 192 && c <= 223 { emit 2 }
+    emit 1
+}
+
+// gridNew(cols, rows) — a fresh blank packed grid state.
+func gridNew(cols, rows) {
+    let total = cols * rows
+    let grid = _blankRow(cols)
+    let rr = 1
+    while rr < rows { grid = grid + _blankRow(cols)  rr = rr + 1 }
+    emit grid + _fill1(total) + _fill1(total) + "|0,0,257,0,0,257,0,0,0,0,0,0,0,1,0,0,0" + fromCharCode(1) + fromCharCode(1)
+}
+
+// gridFeed(state, s, cols, rows) — process byte string s against the packed
+// state (cursor/erase/colour/scroll), return the new packed state.
+// DEC Special Graphics (ESC ( 0) -> single-byte ASCII approximation. The 8x16
+// framebuffer font has no box glyphs and the renderer is one byte per column, so
+// we fold line-drawing to |,-,+ etc. so TUI borders stay readable + aligned.
+func _decGfx(c) {
+    if c == 120 { emit 124 }    // x │ -> |
+    if c == 113 { emit 45 }     // q ─ -> -
+    if c == 106 { emit 43 }     // j ┘ -> +
+    if c == 107 { emit 43 }     // k ┐ -> +
+    if c == 108 { emit 43 }     // l ┌ -> +
+    if c == 109 { emit 43 }     // m └ -> +
+    if c == 110 { emit 43 }     // n ┼ -> +
+    if c == 116 { emit 43 }     // t ├ -> +
+    if c == 117 { emit 43 }     // u ┤ -> +
+    if c == 118 { emit 43 }     // v ┴ -> +
+    if c == 119 { emit 43 }     // w ┬ -> +
+    if c == 96  { emit 43 }     // ` ◆ -> +
+    if c == 97  { emit 35 }     // a ▒ -> #
+    if c == 111 { emit 126 }    // o ⎺ -> ~
+    if c == 115 { emit 95 }     // s ⎽ -> _
+    if c == 126 { emit 46 }     // ~ · -> .
+    emit c
+}
+
+func gridInitMeta() { emit "0,0,257,0,0,257,0,0,0,0,0,0,0,1,0,0,0" + fromCharCode(1) + fromCharCode(1) }
+func gridBlank(gb, ab, bb, ub, cols, rows) {               // fill persistent plane buffers blank
+    let total = cols * rows
+    _blankCellsB(gb, 0, total)  _fillB(ab, 0, total, 1)  _fillB(bb, 0, total, 1)  _fillB(ub, 0, total, 0)
+    emit 0
+}
+// string-state wrapper (tests / CLI). stem uses gridFeedB directly with persistent
+// buffers so there is NO per-feed plane<->string conversion (that was the OOM leak).
+func gridFeed(state, s, cols, rows) {
+    let total = cols * rows
+    let g5 = 5 * total
+    let gb = _sToBuf(substring(state, 0, g5))
+    let ab = _sToBuf(substring(state, g5, g5 + total))
+    let bb = _sToBuf(substring(state, g5 + total, g5 + 2 * total))
+    let meta = substring(state, g5 + 2 * total + 1, len(state))   // tail<SOH>scrolled<SOH>savedGrids
+    let ub = bufNew(total)                                        // underline plane (discarded for CLI/tests)
+    let nm = gridFeedB(gb, ab, bb, ub, meta, s, cols, rows)
+    emit _bufToS(gb, g5) + _bufToS(ab, total) + _bufToS(bb, total) + "|" + nm
+}
+
+// gridFeedB — the real engine. Mutates the plane buffers gb/ab/bb IN PLACE and
+// returns only the (small) meta string. No O(gridsize) work per feed.
+func gridFeedB(gb, ab, bb, ub, meta, s, cols, rows) {
+    let total = cols * rows
+    let g5 = 5 * total
+    let gtotal = g5
+    let stride = cols * 5
+    let tailFull = meta
+    let sohp = indexOf(tailFull, fromCharCode(1))
+    let tail = substring(tailFull, 0, sohp)
+    let afterSoh = substring(tailFull, sohp + 1, len(tailFull))   // scrolled <SOH> savedGrids
+    let soh2 = indexOf(afterSoh, fromCharCode(1))
+    let savedGrids = ""                  // saved MAIN planes while the alt screen is active
+    if soh2 >= 0 { savedGrids = substring(afterSoh, soh2 + 1, len(afterSoh)) }
+    let cr = _cf(tail, 0)
+    let cc = _cf(tail, 1)
+    let pen = _cf(tail, 2)
+    let scr = _cf(tail, 3)               // saved cursor row (ESC7/ESC8)
+    let scc = _cf(tail, 4)               // saved cursor col
+    let spen = _cf(tail, 5)              // saved colour pen
+    let pw = _cf(tail, 6)                // pending wrap (deferred auto-margin)
+    let mlevel = _cf(tail, 8)            // mouse tracking: 0 off, 1 click, 2 drag, 3 any-motion
+    let msgr = _cf(tail, 9)              // mouse SGR(1006) encoding on/off (persist)
+    let altActive = _cf(tail, 10)        // alt screen (1049/1047/47) currently active
+    let savedAltCr = _cf(tail, 11)       // main cursor saved on alt-enter
+    let savedAltCc = _cf(tail, 12)
+    let cvis = _cf(tail, 13)             // cursor visible (DECSET 25); 0 = hidden
+    let cshape = _cf(tail, 14)           // app cursor shape (DECSCUSR): 0 config, 1 bar, 2 block, 3 underline
+    let pasteMode = _cf(tail, 15)        // bracketed paste enabled (DECSET 2004)
+    let focusMode = _cf(tail, 16)        // focus reporting enabled (DECSET 1004)
+    let g0gfx = _cf(tail, 17)            // G0 = DEC special graphics (ESC ( 0) for line-drawing
+    let scrollTop = _cf(tail, 18)        // DECSTBM scroll region top (0-based)
+    let scrollBot = _cf(tail, 19)        // DECSTBM scroll region bottom; (0,0) = full screen
+    let nowrap = _cf(tail, 20)           // DECAWM off (1) — last column overwrites instead of wrapping
+    let decom = _cf(tail, 21)            // DECOM origin mode — CUP relative to the scroll region
+    let scrolled = ""                    // rows scrolled off THIS feed (reset each call)
+    let bell = 0                         // bare BEL (0x07) seen THIS feed (reset each call)
+    let n = len(s)
+    let i = 0
+
+    while i < n {
+        let c = charCode(substring(s, i, i + 1))
+
+        if c == 27 {                                   // ESC
+            if i + 1 >= n { i = n }
+            else {
+                let k = charCode(substring(s, i + 1, i + 2))
+                if k == 91 {                           // '[' → CSI
+                    let j = i + 2
+                    while j < n && _isCsiFinal(charCode(substring(s, j, j + 1))) == 0 { j = j + 1 }
+                    if j >= n { i = n }
+                    else {
+                        let fin = charCode(substring(s, j, j + 1))
+                        let params = substring(s, i + 2, j)
+                        let p0 = _leadInt(params, 1)
+                        if fin >= 65 && fin <= 72 { pw = 0 }    // any cursor move/CUP clears pending wrap
+                        if fin == 72 || fin == 102 {     // 'H'/'f' CUP row;col (1-based)
+                            if decom == 1 {              // origin mode: row relative to region top
+                                let oBot = scrollBot  if scrollTop == 0 && scrollBot == 0 { oBot = rows - 1 }
+                                cr = _clamp(scrollTop + p0 - 1, scrollTop, oBot)
+                            } else { cr = _clamp(p0 - 1, 0, rows - 1) }
+                            cc = _clamp(_leadInt(_afterSemi(params), 1) - 1, 0, cols - 1)
+                        }
+                        if fin == 65 { cr = _clamp(cr - p0, 0, rows - 1) }   // up
+                        if fin == 66 { cr = _clamp(cr + p0, 0, rows - 1) }   // down
+                        if fin == 67 { cc = _clamp(cc + p0, 0, cols - 1) }   // forward
+                        if fin == 68 { cc = _clamp(cc - p0, 0, cols - 1) }   // back
+                        if fin == 71 || fin == 96 { cc = _clamp(p0 - 1, 0, cols - 1) }   // 'G'/'`' CHA: cursor to column
+                        if fin == 100 { cr = _clamp(p0 - 1, 0, rows - 1) }   // 'd' VPA: cursor to row
+                        if fin == 69 { cr = _clamp(cr + p0, 0, rows - 1)  cc = 0  pw = 0 }   // 'E' CNL: next line, col 0
+                        if fin == 70 { cr = _clamp(cr - p0, 0, rows - 1)  cc = 0  pw = 0 }   // 'F' CPL: prev line, col 0
+                        if fin == 109 { pen = _applySgr(pen, params) }       // 'm' SGR colour
+                        if fin == 115 { scr = cr  scc = cc  spen = pen }     // 's' save cursor
+                        if fin == 117 { cr = scr  cc = scc  pen = spen }     // 'u' restore cursor
+                        if fin == 113 {                  // 'q' DECSCUSR — app cursor shape
+                            let ps = _leadInt(params, 0)
+                            if ps == 0 { cshape = 0 }                  // reset -> config default
+                            if ps == 1 || ps == 2 { cshape = 2 }       // block
+                            if ps == 3 || ps == 4 { cshape = 3 }       // underline
+                            if ps == 5 || ps == 6 { cshape = 1 }       // bar
+                        }
+                        if fin == 114 {                  // 'r' DECSTBM — set scroll region (top;bottom)
+                            if len(params) == 0 { scrollTop = 0  scrollBot = 0 }   // reset to full screen
+                            else {
+                                let rt = _leadInt(params, 1) - 1
+                                let rb = _leadInt(_afterSemi(params), rows) - 1
+                                if rt < 0 { rt = 0 }   if rb > rows - 1 { rb = rows - 1 }
+                                if rt < rb {
+                                    scrollTop = rt   scrollBot = rb
+                                    if rt == 0 && rb == rows - 1 { scrollBot = 0 }   // normalize full -> sentinel
+                                }
+                            }
+                            cr = 0  cc = 0  pw = 0       // DECSTBM homes the cursor
+                        }
+                        if fin == 76 {                   // 'L' IL — insert p0 blank lines at cursor
+                            let ilBot = scrollBot  if scrollTop == 0 && scrollBot == 0 { ilBot = rows - 1 }
+                            if cr >= scrollTop && cr <= ilBot {
+                                let kk = 0
+                                while kk < p0 && cr + kk <= ilBot {
+                                    _scrollRegionDownB(gb, cr, ilBot, stride)  _scrollRegionDownB(ab, cr, ilBot, cols)
+                                    _scrollRegionDownB(bb, cr, ilBot, cols)    _scrollRegionDownB(ub, cr, ilBot, cols)
+                                    _blankFullRowB(gb, ab, bb, ub, cr, cols)
+                                    kk = kk + 1
+                                }
+                                cc = 0
+                            }
+                        }
+                        if fin == 77 {                   // 'M' DL — delete p0 lines at cursor
+                            let dlBot = scrollBot  if scrollTop == 0 && scrollBot == 0 { dlBot = rows - 1 }
+                            if cr >= scrollTop && cr <= dlBot {
+                                let kk = 0
+                                while kk < p0 && cr + kk <= dlBot {
+                                    _scrollRegionBytesB(gb, cr, dlBot, stride, 1, cols)  _scrollRegionBytesB(ab, cr, dlBot, cols, 1, cols)
+                                    _scrollRegionBytesB(bb, cr, dlBot, cols, 1, cols)    _scrollRegionBytesB(ub, cr, dlBot, cols, 1, cols)
+                                    _blankFullRowB(gb, ab, bb, ub, dlBot, cols)
+                                    kk = kk + 1
+                                }
+                                cc = 0
+                            }
+                        }
+                        if fin == 88 {                   // 'X' ECH — erase p0 chars at cursor (no shift)
+                            let ec = cc + p0  if ec > cols { ec = cols }
+                            let cnt = ec - cc  let o = cr * cols + cc
+                            _blankCellsB(gb, o, cnt)  _fillB(ab, o, cnt, 1)  _fillB(bb, o, cnt, 1)  _fillB(ub, o, cnt, 0)
+                        }
+                        if fin == 64 {                   // '@' ICH — insert p0 blanks at cursor
+                            let ni = p0  if ni > cols - cc { ni = cols - cc }
+                            if ni > 0 { _rowInsertB(gb, ab, bb, ub, cr, cc, ni, cols) }
+                        }
+                        if fin == 80 {                   // 'P' DCH — delete p0 chars at cursor
+                            let nd = p0  if nd > cols - cc { nd = cols - cc }
+                            if nd > 0 { _rowDeleteB(gb, ab, bb, ub, cr, cc, nd, cols) }
+                        }
+                        if fin == 74 {                   // 'J' erase in display (honour param)
+                            let pj = _leadInt(params, 0)
+                            let ja = 0
+                            let jb = total
+                            if pj == 0 { ja = cr * cols + cc }       // cursor → end of screen
+                            if pj == 1 { jb = cr * cols + cc + 1 }    // start → cursor
+                            // pj >= 2: whole screen
+                            let jcnt = jb - ja
+                            _blankCellsB(gb, ja, jcnt)  _fillB(ab, ja, jcnt, 1)  _fillB(bb, ja, jcnt, 1)  _fillB(ub, ja, jcnt, 0)
+                            if pj >= 2 { cr = 0  cc = 0 }            // clear-all homes (matches kryofetch)
+                        }
+                        if fin == 75 {                   // 'K' erase in line (honour param)
+                            let pk = _leadInt(params, 0)
+                            let a = 0
+                            let b = cols
+                            if pk == 0 { a = cc }                    // cursor → end
+                            if pk == 1 { b = cc + 1 }                // start → cursor
+                            // pk == 2 (or other): whole line (a=0, b=cols)
+                            let cnt = b - a
+                            let o1 = cr * cols + a
+                            _blankCellsB(gb, o1, cnt)  _fillB(ab, o1, cnt, 1)  _fillB(bb, o1, cnt, 1)  _fillB(ub, o1, cnt, 0)
+                        }
+                        if fin == 104 || fin == 108 {    // 'h' DECSET / 'l' DECRST (private '?' modes)
+                            if len(params) > 0 && charCode(substring(params, 0, 1)) == 63 {
+                                let mode = _leadInt(substring(params, 1, len(params)), 0)
+                                let on = 0
+                                if fin == 104 { on = 1 }
+                                if mode == 1000 { if on == 1 { mlevel = 1 } else { mlevel = 0 } }  // click
+                                if mode == 1002 { if on == 1 { mlevel = 2 } else { mlevel = 0 } }  // button-drag
+                                if mode == 1003 { if on == 1 { mlevel = 3 } else { mlevel = 0 } }  // any-motion
+                                if mode == 1006 { msgr = on }                                      // SGR encoding
+                                if mode == 25 { cvis = on }                                        // cursor show/hide
+                                if mode == 2004 { pasteMode = on }                                 // bracketed paste
+                                if mode == 1004 { focusMode = on }                                 // focus reporting
+                                if mode == 7 { if on == 1 { nowrap = 0 } else { nowrap = 1 } }      // DECAWM autowrap
+                                if mode == 6 { decom = on  cc = 0  if on == 1 { cr = scrollTop } else { cr = 0 } }  // DECOM origin
+                                if mode == 1049 || mode == 1047 || mode == 47 {                    // alt screen
+                                    if on == 1 {
+                                        if altActive == 0 {
+                                            savedGrids = _bufToS(gb, g5) + _bufToS(ab, total) + _bufToS(bb, total)  // save main
+                                            savedAltCr = cr  savedAltCc = cc
+                                            _blankCellsB(gb, 0, total)  _fillB(ab, 0, total, 1)  _fillB(bb, 0, total, 1)  _fillB(ub, 0, total, 0)
+                                            cr = 0  cc = 0  pw = 0
+                                            scrollTop = 0  scrollBot = 0   // alt screen starts full-region
+                                            altActive = 1
+                                        }
+                                    } else {
+                                        if altActive == 1 {
+                                            _loadBuf(gb, savedGrids, 0, g5)             // restore main (in place)
+                                            _loadBuf(ab, savedGrids, g5, total)
+                                            _loadBuf(bb, savedGrids, g5 + total, total)
+                                            _fillB(ub, 0, total, 0)   // underline not saved across alt screen
+                                            cr = savedAltCr  cc = savedAltCc  pw = 0
+                                            scrollTop = 0  scrollBot = 0   // region reset on leaving alt
+                                            savedGrids = ""
+                                            altActive = 0
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        i = j + 1
+                    }
+                } else {
+                    if k == 93 {                         // ']' → OSC: skip to BEL/ST
+                        let j = i + 2
+                        let done = 0
+                        while j < n && done == 0 {
+                            let cj = charCode(substring(s, j, j + 1))
+                            if cj == 7 { done = 1  i = j + 1 }
+                            else {
+                                if cj == 27 && j + 1 < n && charCode(substring(s, j + 1, j + 2)) == 92 { done = 1  i = j + 2 }
+                                else { j = j + 1 }
+                            }
+                        }
+                        if done == 0 { i = n }
+                    } else {
+                        if k == 40 || k == 41 || k == 42 || k == 43 {
+                            // charset designation: ESC ( / ) / * / + <final> (3-byte).
+                            // G0 (ESC ( <f>) drives line-drawing: '0' = DEC special
+                            // graphics, 'B'/'A'/... = ASCII. G1..G3 just consumed.
+                            if k == 40 && i + 2 < n {
+                                let fb = charCode(substring(s, i + 2, i + 3))
+                                if fb == 48 { g0gfx = 1 } else { g0gfx = 0 }
+                            }
+                            i = i + 3
+                        } else {
+                            if k == 55 { scr = cr  scc = cc  spen = pen }    // ESC 7 save cursor
+                            if k == 56 { cr = scr  cc = scc  pen = spen }    // ESC 8 restore cursor
+                            if k == 77 {                                     // ESC M = RI reverse index
+                                let riTop = scrollTop
+                                let riBot = scrollBot  if scrollTop == 0 && scrollBot == 0 { riBot = rows - 1 }
+                                if cr == riTop {
+                                    _scrollRegionDownB(gb, riTop, riBot, stride)  _scrollRegionDownB(ab, riTop, riBot, cols)
+                                    _scrollRegionDownB(bb, riTop, riBot, cols)    _scrollRegionDownB(ub, riTop, riBot, cols)
+                                    _blankFullRowB(gb, ab, bb, ub, riTop, cols)
+                                } else { if cr > 0 { cr = cr - 1 } }
+                            }
+                            if k == 99 {                                     // ESC c = RIS full reset
+                                _blankCellsB(gb, 0, total)  _fillB(ab, 0, total, 1)  _fillB(bb, 0, total, 1)  _fillB(ub, 0, total, 0)
+                                cr = 0  cc = 0  pen = 257  pw = 0  g0gfx = 0  altActive = 0  scrollTop = 0  scrollBot = 0  nowrap = 0  decom = 0
+                            }
+                            i = i + 2                        // ESC x (2-byte)
+                        }
+                    }
+                }
+            }
+        } else {
+            if c == 10 {                                                         // LF → newline
+                cc = 0  pw = 0
+                let eBot = scrollBot  if scrollTop == 0 && scrollBot == 0 { eBot = rows - 1 }
+                if cr == eBot {                                                  // at bottom margin -> scroll region up
+                    if scrollTop == 0 && eBot == rows - 1 && altActive == 0 {    // full screen -> feed scrollback
+                        scrolled = scrolled + _renderRowB(gb, ab, bb, 0, cols) + fromCharCode(10)
+                    }
+                    _scrollRegionBytesB(gb, scrollTop, eBot, stride, 1, cols)  _blankCellsB(gb, eBot * cols, cols)
+                    _scrollRegionBytesB(ab, scrollTop, eBot, cols, 1, cols)  _fillB(ab, eBot * cols, cols, 1)
+                    _scrollRegionBytesB(bb, scrollTop, eBot, cols, 1, cols)  _fillB(bb, eBot * cols, cols, 1)
+                    _scrollRegionBytesB(ub, scrollTop, eBot, cols, 1, cols)  _fillB(ub, eBot * cols, cols, 0)
+                } else { if cr < rows - 1 { cr = cr + 1 } }
+                i = i + 1
+            }
+            else {
+                if c == 13 { cc = 0  pw = 0  i = i + 1 }                         // CR
+                else {
+                    if c == 8 { if cc > 0 { cc = cc - 1 }  pw = 0  i = i + 1 }   // BS
+                    else {
+                        if c == 9 {                                              // TAB
+                            cc = ((cc / 8) + 1) * 8
+                            if cc >= cols { cc = cols - 1 }
+                            i = i + 1
+                        } else {
+                            if c >= 32 {                                         // printable (incl UTF-8)
+                                let clen = _utf8Len(c)
+                                if i + clen > n { clen = n - i }
+                                if pw == 1 {                                     // deferred wrap from last col
+                                    cc = 0  pw = 0
+                                    let eB2 = scrollBot  if scrollTop == 0 && scrollBot == 0 { eB2 = rows - 1 }
+                                    if cr == eB2 {
+                                        if scrollTop == 0 && eB2 == rows - 1 && altActive == 0 {
+                                            scrolled = scrolled + _renderRowB(gb, ab, bb, 0, cols) + fromCharCode(10)
+                                        }
+                                        _scrollRegionBytesB(gb, scrollTop, eB2, stride, 1, cols)  _blankCellsB(gb, eB2 * cols, cols)
+                                        _scrollRegionBytesB(ab, scrollTop, eB2, cols, 1, cols)  _fillB(ab, eB2 * cols, cols, 1)
+                                        _scrollRegionBytesB(bb, scrollTop, eB2, cols, 1, cols)  _fillB(bb, eB2 * cols, cols, 1)
+                                        _scrollRegionBytesB(ub, scrollTop, eB2, cols, 1, cols)  _fillB(ub, eB2 * cols, cols, 0)
+                                    } else { if cr < rows - 1 { cr = cr + 1 } }
+                                }
+                                let idx = cr * cols + cc
+                                let pul = pen / 131072           // underline flag (pen bit 17)
+                                let prev = (pen - pul * 131072) / 65536   // reverse flag (bit 16)
+                                let pbase = pen - pul * 131072 - prev * 65536
+                                let pfg = pbase / 256
+                                let pbg = pbase - pfg * 256
+                                if prev == 1 {                   // reverse: swap fg/bg; default sides -> black/white
+                                    let nfg = pbg  let nbg = pfg
+                                    if pbg == 1 { nfg = 2 }       // default bg shown as fg -> palette 0 (black)
+                                    if pfg == 1 { nbg = 17 }      // default fg shown as bg -> palette 15 (white)
+                                    pfg = nfg  pbg = nbg
+                                }
+                                let glyph = substring(s, i, i + clen)
+                                if g0gfx == 1 && clen == 1 && c >= 96 && c <= 126 { glyph = fromCharCode(_decGfx(c)) }
+                                _putCellB(gb, idx, glyph)
+                                bufSetByte(ab, idx, pfg)
+                                bufSetByte(bb, idx, pbg)
+                                bufSetByte(ub, idx, pul)
+                                if cc >= cols - 1 { if nowrap == 0 { pw = 1 } }  // last col: defer wrap (unless DECAWM off)
+                                else { cc = cc + 1 }
+                                i = i + clen
+                            } else { if c == 7 { bell = 1 }  i = i + 1 }          // BEL (bell) / other control byte
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    emit cr + "," + cc + "," + pen + "," + scr + "," + scc + "," + spen + "," + pw + "," + bell + "," + mlevel + "," + msgr + "," + altActive + "," + savedAltCr + "," + savedAltCc + "," + cvis + "," + cshape + "," + pasteMode + "," + focusMode + "," + g0gfx + "," + scrollTop + "," + scrollBot + "," + nowrap + "," + decom + fromCharCode(1) + scrolled + fromCharCode(1) + savedGrids
+}
+
+// _renderRow(grid, attr, battr, base, cols) — one cell-row (base = row*cols)
+// rendered to text: trailing blanks trimmed, fg+bg re-emitted, no trailing \n.
+func _renderRow(grid, attr, battr, base, cols) {
+    let e = cols
+    let trimming = 1
+    while e > 0 && trimming == 1 {
+        let off = (base + e - 1) * 5
+        let w = charCode(substring(grid, off, off + 1))
+        if w == 1 && substring(grid, off + 1, off + 2) == " " { e = e - 1 }
+        else { trimming = 0 }
+    }
+    let out = sbNew()
+    let lastFg = 1
+    let lastBg = 1
+    let col = 0
+    while col < e {
+        let cellFg = charCode(substring(attr, base + col, base + col + 1))
+        let cellBg = charCode(substring(battr, base + col, base + col + 1))
+        if cellFg != lastFg || cellBg != lastBg {
+            out = sbAppend(out, _sgrPair(cellFg, cellBg))
+            lastFg = cellFg
+            lastBg = cellBg
+        }
+        let off = (base + col) * 5
+        let w = charCode(substring(grid, off, off + 1))
+        out = sbAppend(out, substring(grid, off + 1, off + 1 + w))
+        col = col + 1
+    }
+    if lastFg != 1 || lastBg != 1 { out = sbAppend(out, fromCharCode(27) + "[0m") }
+    emit sbToString(out)
+}
+
+// gridRenderB(gb,ab,bb,...) reads the plane buffers directly (no string state).
+func gridRenderB(gb, ab, bb, cols, rows) {
+    let out = sbNew()
+    let r = 0
+    while r < rows {
+        out = sbAppend(out, _renderRowB(gb, ab, bb, r * cols, cols))
+        if r < rows - 1 { out = sbAppend(out, fromCharCode(10)) }
+        r = r + 1
+    }
+    emit sbToString(out)
+}
+func gridRender(state, cols, rows) {                       // string-state wrapper (tests/CLI)
+    let total = cols * rows  let g5 = 5 * total
+    emit gridRenderB(_sToBuf(substring(state, 0, g5)), _sToBuf(substring(state, g5, g5 + total)), _sToBuf(substring(state, g5 + total, g5 + 2 * total)), cols, rows)
+}
+
+// _plainRow / gridPlain — like _renderRow / gridRender but GLYPHS ONLY, no SGR.
+// The Wayland frontend colours each cell from the attr/battr planes, so it needs
+// the glyph stream clean (embedded SGR would draw as text and break column
+// alignment). One byte per ASCII cell keeps column c == byte c.
+func _plainRow(grid, base, cols) {
+    let e = cols
+    let trimming = 1
+    while e > 0 && trimming == 1 {
+        let off = (base + e - 1) * 5
+        let w = charCode(substring(grid, off, off + 1))
+        if w == 1 && substring(grid, off + 1, off + 2) == " " { e = e - 1 }
+        else { trimming = 0 }
+    }
+    let out = sbNew()
+    let col = 0
+    while col < e {
+        let off = (base + col) * 5
+        let w = charCode(substring(grid, off, off + 1))
+        out = sbAppend(out, substring(grid, off + 1, off + 1 + w))
+        col = col + 1
+    }
+    emit sbToString(out)
+}
+func _plainRowB(gb, base, cols) {
+    let e = cols
+    let trimming = 1
+    while e > 0 && trimming == 1 {
+        let off = (base + e - 1) * 5
+        if toInt(bufGetByte(gb, off)) == 1 && toInt(bufGetByte(gb, off + 1)) == 32 { e = e - 1 }
+        else { trimming = 0 }
+    }
+    let out = sbNew()
+    let col = 0
+    while col < e {
+        let off = (base + col) * 5
+        let w = toInt(bufGetByte(gb, off))
+        let k = 0
+        while k < w { out = sbAppend(out, fromCharCode(toInt(bufGetByte(gb, off + 1 + k))))  k = k + 1 }
+        col = col + 1
+    }
+    emit sbToString(out)
+}
+func gridPlainB(gb, cols, rows) {
+    let out = sbNew()
+    let r = 0
+    while r < rows {
+        out = sbAppend(out, _plainRowB(gb, r * cols, cols))
+        if r < rows - 1 { out = sbAppend(out, fromCharCode(10)) }
+        r = r + 1
+    }
+    emit sbToString(out)
+}
+func gridPlain(state, cols, rows) {                        // string-state wrapper (tests/CLI)
+    let total = cols * rows  let g5 = 5 * total
+    emit gridPlainB(_sToBuf(substring(state, 0, g5)), cols, rows)
+}
+
+// gridStripSgr(s) — drop all ESC[…m SGR from a (multi-line) string; public wrapper
+// over _stripSgrLine for the frontend's monochrome scrollback view.
+func gridStripSgr(s) { emit _stripSgrLine(s) }
+
+// gridSafeLen(s) — length of the prefix of s safe to feed: excludes a trailing
+// INCOMPLETE escape sequence or UTF-8 char. The interactive bridge reads the pty
+// in arbitrary chunks that can split a sequence mid-way; feeding the partial
+// would corrupt the grid. The caller feeds s[0..gridSafeLen(s)] and carries the
+// rest over to prepend to the next chunk.
+func gridSafeLen(s) {
+    let n = len(s)
+    if n == 0 { emit 0 }
+
+    // (1) trailing partial escape: find the last ESC; cut there if incomplete.
+    let escCut = n
+    let p = n - 1
+    let lastEsc = 0 - 1
+    while p >= 0 {
+        if charCode(substring(s, p, p + 1)) == 27 { lastEsc = p  p = 0 - 1 }
+        else { p = p - 1 }
+    }
+    if lastEsc >= 0 {
+        let q = lastEsc + 1
+        if q >= n { escCut = lastEsc }                  // lone trailing ESC
+        else {
+            let k = charCode(substring(s, q, q + 1))
+            if k == 91 {                                // CSI: needs a final letter
+                let j = q + 1
+                let done = 0
+                while j < n {
+                    if _isCsiFinal(charCode(substring(s, j, j + 1))) == 1 { done = 1  j = n }
+                    else { j = j + 1 }
+                }
+                if done == 0 { escCut = lastEsc }
+            }
+            if k == 93 {                                // OSC: needs BEL
+                let j = q + 1
+                let done = 0
+                while j < n {
+                    if charCode(substring(s, j, j + 1)) == 7 { done = 1  j = n }
+                    else { j = j + 1 }
+                }
+                if done == 0 { escCut = lastEsc }
+            }
+            if k == 40 || k == 41 || k == 42 || k == 43 {   // charset ESC (/)/*/+ <final>: 3 bytes
+                if lastEsc + 3 > n { escCut = lastEsc }
+            }
+        }
+    }
+
+    // (2) trailing partial UTF-8 char.
+    let utfCut = n
+    let last = charCode(substring(s, n - 1, n))
+    if last >= 192 { utfCut = n - 1 }                   // lead byte at end -> incomplete
+    else {
+        if last >= 128 {                                // continuation -> find the lead
+            let lpos = n - 1
+            while lpos > 0 && charCode(substring(s, lpos, lpos + 1)) >= 128 && charCode(substring(s, lpos, lpos + 1)) <= 191 { lpos = lpos - 1 }
+            let lead = charCode(substring(s, lpos, lpos + 1))
+            if lead >= 192 {
+                if lpos + _utf8Len(lead) > n { utfCut = lpos }
+            }
+        }
+    }
+
+    if escCut < utfCut { emit escCut }
+    emit utfCut
+}
+
+// oscTitle(s, old) — the window title from an OSC 0/2 (`ESC]0;…BEL` / `ESC]2;…`)
+// in s, else `old`. Used by the bridge to track the shell-set title.
+func oscTitle(s, old) {
+    let e = fromCharCode(27)
+    let m = indexOf(s, e + "]0;")
+    if m < 0 { m = indexOf(s, e + "]2;") }
+    if m < 0 { emit old }
+    let rest = substring(s, m + 4, len(s))   // after "ESC]N;"
+    let bel = indexOf(rest, fromCharCode(7))  // BEL terminator
+    let st = indexOf(rest, e + fromCharCode(92))   // or ST (ESC \)
+    let stop = bel
+    if stop < 0 { stop = st }
+    else { if st >= 0 && st < stop { stop = st } }
+    if stop < 0 { emit old }                  // incomplete -> keep old
+    emit substring(rest, 0, stop)
+}
+
+// gridCursor(state, cols, rows) — the cursor position as "row,col" (0-based).
+func gridCursor(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let tail = substring(tailFull, 0, indexOf(tailFull, fromCharCode(1)))
+    if _cf(tail, 13) == 0 { emit "9999,0" }      // cursor hidden (DECSET 25 off)
+    emit _cf(tail, 0) + "," + _cf(tail, 1)
+}
+
+// gridCshape(state, cols, rows) — app-requested cursor shape (DECSCUSR): 0 = use
+// the config default, 1 = bar, 2 = block, 3 = underline.
+func gridCshape(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let tail = substring(tailFull, 0, indexOf(tailFull, fromCharCode(1)))
+    emit _cf(tail, 14)
+}
+
+// gridMouse(state, cols, rows) — "mlevel,msgr": the app's mouse tracking level
+// (0 off / 1 click / 2 drag / 3 any-motion) and SGR(1006) encoding flag.
+func gridMouse(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let sohp = indexOf(tailFull, fromCharCode(1))
+    let tail = substring(tailFull, 0, sohp)
+    emit _cf(tail, 8) + "," + _cf(tail, 9)
+}
+
+// gridShape(state, cols, rows) — app-requested cursor shape (DECSCUSR):
+// 0 = use config default, 1 = bar, 2 = block, 3 = underline.
+func gridShape(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let tail = substring(tailFull, 0, indexOf(tailFull, fromCharCode(1)))
+    emit _cf(tail, 14)
+}
+
+// gridPaste(state, cols, rows) — 1 if the app enabled bracketed paste (DECSET 2004).
+func gridPaste(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let tail = substring(tailFull, 0, indexOf(tailFull, fromCharCode(1)))
+    emit _cf(tail, 15)
+}
+
+// gridAlt(state, cols, rows) — 1 if the alternate screen is active.
+func gridAlt(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let tail = substring(tailFull, 0, indexOf(tailFull, fromCharCode(1)))
+    emit _cf(tail, 10)
+}
+
+// gridFocus(state, cols, rows) — 1 if the app enabled focus reporting (DECSET 1004).
+func gridFocus(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let tail = substring(tailFull, 0, indexOf(tailFull, fromCharCode(1)))
+    emit _cf(tail, 16)
+}
+
+// gridBell(state, cols, rows) — 1 if a bare BEL (0x07) arrived during the last
+// gridFeed, else 0. The bridge raises a one-shot bell from this.
+func gridBell(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let sohp = indexOf(tailFull, fromCharCode(1))
+    emit _cf(substring(tailFull, 0, sohp), 7)
+}
+
+// gridScrolled(state, cols, rows) — the rows that scrolled off the top during the
+// last gridFeed (rendered text, one per \n). Empty if nothing scrolled. The
+// bridge drains this into its scrollback history.
+func gridScrolled(state, cols, rows) {
+    let total = cols * rows
+    let tailFull = substring(state, 7 * total + 1, len(state))
+    let sohp = indexOf(tailFull, fromCharCode(1))
+    let afterSoh = substring(tailFull, sohp + 1, len(tailFull))   // scrolled <SOH> savedGrids
+    let soh2 = indexOf(afterSoh, fromCharCode(1))
+    if soh2 >= 0 { emit substring(afterSoh, 0, soh2) }            // just the scrolled part
+    emit afterSoh
+}
+
+// ── meta-direct readers (stem holds the small meta string; no planes) ─────────
+func gridCursorM(meta) {
+    let tail = substring(meta, 0, indexOf(meta, fromCharCode(1)))
+    if _cf(tail, 13) == 0 { emit "9999,0" }                      // cursor hidden (DECSET 25)
+    emit _cf(tail, 0) + "," + _cf(tail, 1)
+}
+func gridCshapeM(meta) {
+    emit _cf(substring(meta, 0, indexOf(meta, fromCharCode(1))), 14)
+}
+func gridBellM(meta) {
+    emit _cf(substring(meta, 0, indexOf(meta, fromCharCode(1))), 7)
+}
+func gridPasteM(meta) {                  // 1 if bracketed paste (DECSET 2004) is on
+    emit _cf(substring(meta, 0, indexOf(meta, fromCharCode(1))), 15)
+}
+func gridMouseM(meta) {                  // "mlevel,msgr": app mouse tracking + SGR(1006) flag
+    let tail = substring(meta, 0, indexOf(meta, fromCharCode(1)))
+    emit _cf(tail, 8) + "," + _cf(tail, 9)
+}
+func gridScrolledM(meta) {
+    let sohp = indexOf(meta, fromCharCode(1))
+    let afterSoh = substring(meta, sohp + 1, len(meta))
+    let soh2 = indexOf(afterSoh, fromCharCode(1))
+    if soh2 >= 0 { emit substring(afterSoh, 0, soh2) }
+    emit afterSoh
+}
+
+// _stripSgrLine(s) — drop ESC[…<final> sequences so a line is searchable plain text.
+func _stripSgrLine(s) {
+    let out = sbNew()
+    let i = 0
+    let n = len(s)
+    while i < n {
+        let c = charCode(substring(s, i, i + 1))
+        if c == 27 {
+            i = i + 1
+            if i < n && charCode(substring(s, i, i + 1)) == 91 { i = i + 1 }   // '['
+            let done = 0
+            while i < n && done == 0 {
+                let k = charCode(substring(s, i, i + 1))
+                i = i + 1
+                if k >= 64 && k <= 126 { done = 1 }                            // CSI final byte
+            }
+        } else {
+            out = sbAppend(out, substring(s, i, i + 1))
+            i = i + 1
+        }
+    }
+    emit sbToString(out)
+}
+
+// gridFind(scrollback, gridText, rows, query, matchIdx) — find the matchIdx-th
+// occurrence of query (counting from the most recent line up), wrapping. Returns
+// "scrollOff,matchRow,matchCol,matchLen" to bring it into view + highlight it, or
+// "-1,-1,-1,-1" if no match / empty query.
+func gridFind(scrollback, gridText, rows, query, matchIdx) {
+    if len(query) == 0 { emit "-1,-1,-1,-1,0,0" }
+    let combined = scrollback + gridText
+    let nLines = lineCount(combined)
+    let total = 0
+    let li = nLines - 1
+    while li >= 0 {
+        if indexOf(_stripSgrLine(getLine(combined, li)), query) >= 0 { total = total + 1 }
+        li = li - 1
+    }
+    if total == 0 { emit "-1,-1,-1,-1,0,0" }
+    let mi = matchIdx
+    while mi >= total { mi = mi - total }
+    while mi < 0 { mi = mi + total }
+    let seen = 0
+    let foundLine = 0 - 1
+    let foundCol = 0
+    li = nLines - 1
+    while li >= 0 && foundLine < 0 {
+        let pos = indexOf(_stripSgrLine(getLine(combined, li)), query)
+        if pos >= 0 {
+            if seen == mi { foundLine = li  foundCol = pos }
+            seen = seen + 1
+        }
+        li = li - 1
+    }
+    // Place the match ~1/3 down the view. NOTE: macho integer subtraction
+    // underflows unsigned, so a-b is only safe when a>b — guard every step.
+    let smax = 0
+    if nLines > rows { smax = nLines - rows }
+    let third = rows / 3
+    let viewStart = 0
+    if foundLine > third { viewStart = foundLine - third }
+    if viewStart > smax { viewStart = smax }
+    let scrollOff = 0
+    if smax > viewStart { scrollOff = smax - viewStart }
+    let matchRow = 0
+    if foundLine > viewStart { matchRow = foundLine - viewStart }
+    emit scrollOff + "," + matchRow + "," + foundCol + "," + len(query) + "," + (mi + 1) + "," + total
+}
+
+// gridScrollView(scrollback, gridText, rows, scrollOff) — `rows` lines of the
+// combined (scrollback ++ live grid) buffer, scrolled `scrollOff` lines up from
+// the bottom. scrollOff 0 = the live screen.
+func gridScrollView(scrollback, gridText, rows, scrollOff) {
+    let combined = scrollback + gridText
+    let nLines = lineCount(combined)
+    let start = nLines - rows - scrollOff
+    if start < 0 { start = 0 }
+    let out = sbNew()
+    let i = 0
+    while i < rows {
+        let li = start + i
+        if li >= 0 && li < nLines { out = sbAppend(out, getLine(combined, li)) }
+        if i < rows - 1 { out = sbAppend(out, fromCharCode(10)) }
+        i = i + 1
+    }
+    emit sbToString(out)
+}
+
+// renderGrid(s, cols, rows) — one-shot: feed s into a fresh grid, render to text.
+func renderGrid(s, cols, rows) {
+    emit gridRender(gridFeed(gridNew(cols, rows), s, cols, rows), cols, rows)
+}
