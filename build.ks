@@ -14,6 +14,9 @@ func buildRun(executable, arguments) {
     if status != "0" { printErr("Build failed: " + executable + " (exit " + status + ")\n") exit("1") }
     emit 1
 }
+// Quote one path for the shell string below. build.ks compiles on its own, so it
+// cannot reach shellQuote in src/catalog.k.
+func buildQuote(text) { emit "'" + replace(text, "'", "'\"'\"'") + "'" }
 just run {
     let pool = newPool()
     let root = nsToStr(msg(msg(cls("NSFileManager"), "defaultManager"), "currentDirectoryPath"))
@@ -26,7 +29,13 @@ just run {
     buildRun(compiler, buildArgs3(root + "/src/main.ks", "-o", executable))
     buildRun("/bin/cp", buildArgs2(root + "/resources/stem.conf", contents + "/Resources/stem.conf"))
     buildRun("/bin/cp", buildArgs2(root + "/vendor/stem/LICENSE", contents + "/Resources/STEM-LICENSE"))
-    let plist = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>CFBundleName</key><string>Krypsec</string>\n<key>CFBundleDisplayName</key><string>Krypsec</string>\n<key>CFBundleExecutable</key><string>Krypsec</string>\n<key>CFBundleIdentifier</key><string>org.krypton-lang.krypsec</string>\n<key>CFBundlePackageType</key><string>APPL</string>\n<key>CFBundleShortVersionString</key><string>0.1.0</string>\n<key>CFBundleVersion</key><string>1</string>\n<key>LSMinimumSystemVersion</key><string>14.0</string>\n<key>NSPrincipalClass</key><string>NSApplication</string>\n<key>NSHighResolutionCapable</key><true/>\n<key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>\n</dict></plist>\n"
+    // App icon: assets/krypsec.png is the single source. One shell pipeline
+    // renders the .iconset and packs Contents/Resources/Krypsec.icns, so the
+    // bundle stays self-contained and signed. A missing PNG leaves the bundle
+    // icon-less instead of failing the build.
+    let iconScript = "src=" + buildQuote(root + "/assets/krypsec.png") + "; [ -f \"$src\" ] || exit 0; set -e; icon=" + buildQuote(root + "/.build/Krypsec.iconset") + "; rm -rf \"$icon\"; mkdir -p \"$icon\"; for s in 16 32 128 256 512; do sips -z $s $s \"$src\" --out \"$icon/icon_${s}x${s}.png\" >/dev/null; sips -z $((s * 2)) $((s * 2)) \"$src\" --out \"$icon/icon_${s}x${s}@2x.png\" >/dev/null; done; iconutil -c icns \"$icon\" -o " + buildQuote(contents + "/Resources/Krypsec.icns")
+    buildRun("/bin/zsh", buildArgs2("-c", iconScript))
+    let plist = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>CFBundleName</key><string>Krypsec</string>\n<key>CFBundleDisplayName</key><string>Krypsec</string>\n<key>CFBundleExecutable</key><string>Krypsec</string>\n<key>CFBundleIdentifier</key><string>org.krypton-lang.krypsec</string>\n<key>CFBundleIconFile</key><string>Krypsec</string>\n<key>CFBundlePackageType</key><string>APPL</string>\n<key>CFBundleShortVersionString</key><string>0.1.0</string>\n<key>CFBundleVersion</key><string>1</string>\n<key>LSMinimumSystemVersion</key><string>14.0</string>\n<key>NSPrincipalClass</key><string>NSApplication</string>\n<key>NSHighResolutionCapable</key><true/>\n<key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>\n</dict></plist>\n"
     if msg_4(nsString(plist), "writeToFile:atomically:encoding:error:", nsString(contents + "/Info.plist"), 1, 4, 0) == 0 { printErr("Cannot write bundle metadata.\n") exit("1") }
     buildRun("/usr/bin/plutil", buildArgs2("-lint", contents + "/Info.plist"))
     buildRun("/usr/bin/codesign", buildArgs4("--force", "--sign", "-", bundle))
