@@ -3,6 +3,7 @@
 import "k:okui"
 import "catalog.k"
 import "workbench.k"
+import "options.k"
 import "../tests/selftest.k"
 import "k:cocoa"
 import "k:objc"
@@ -1441,7 +1442,7 @@ func layoutFrameTree(n, x, y, w, h) {
 }
 func retileFrames(W, H) {
   let pad = brainFlagS("stem.padding", 0)
-  layoutFrameTree(cocoaGetAssocKey(appH(), "stem.tree"), 320 + pad, 28 + pad, W - 320 - pad * 2, H - 236 - pad * 2)
+  layoutFrameTree(cocoaGetAssocKey(appH(), "stem.tree"), 320 + pad, 28 + pad, W - 320 - pad * 2, H - 520 - pad * 2)
   emit "1"
 }
 func splitTree(n, target, axis, newIdx, before) {
@@ -1488,7 +1489,7 @@ func retile(axis) {
   let W = cocoaNumberVal(cocoaGetAssocKey(app, "stem.w"))
   let H = cocoaNumberVal(cocoaGetAssocKey(app, "stem.h"))
   let pad = brainFlagS("stem.padding", 0)
-  layoutTree(cocoaGetAssocKey(app, "stem.tree"), 320 + pad, 28 + pad, W - 320 - pad * 2, H - 236 - pad * 2)
+  layoutTree(cocoaGetAssocKey(app, "stem.tree"), 320 + pad, 28 + pad, W - 320 - pad * 2, H - 520 - pad * 2)
   let leaves = treeLeaves()
   let ln = cocoaArrayCount(leaves)
   let scrolls = cocoaGetAssocKey(app, "stem.pscrolls")
@@ -1724,7 +1725,7 @@ just run {
   cocoaSetAssocKey(app, "stem.pendingh", cocoaNumber(height))
   cocoaSetAssocKey(app, "stem.resizewait", cocoaNumber(0))
   cocoaSetAssocKey(app, "stem.cellw1000", cocoaNumber(((width - 320 - toInt(cfgVal(cfg, "padding", "8")) * 2) * 1000) / cols))
-  cocoaSetAssocKey(app, "stem.cellh1000", cocoaNumber(((height - 236 - toInt(cfgVal(cfg, "padding", "8")) * 2) * 1000) / rows))
+  cocoaSetAssocKey(app, "stem.cellh1000", cocoaNumber(((height - 520 - toInt(cfgVal(cfg, "padding", "8")) * 2) * 1000) / rows))
   cocoaSetAssocKey(app, "stem.shell", nsString(shell))
   cocoaSetAssocKey(app, "stem.tree", mkLeaf(0))
   cocoaSetWindowMinSize(win, toInt(cfgVal(cfg, "minimum_width", "480")), toInt(cfgVal(cfg, "minimum_height", "280")))
@@ -1746,10 +1747,10 @@ just run {
   // all 4 panes created + warm; only pane 0 shown until split
   let pad = toInt(cfgVal(cfg, "padding", "8"))
   stemPaintChrome(win, width, height, pad)
-  let kview = stemMakePaneView(m0, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 236 - pad * 2, cols, rows)
-  let kv1 = stemMakePaneView(m1, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 236 - pad * 2, cols, rows)
-  let kv2 = stemMakePaneView(m2, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 236 - pad * 2, cols, rows)
-  let kv3 = stemMakePaneView(m3, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 236 - pad * 2, cols, rows)
+  let kview = stemMakePaneView(m0, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 520 - pad * 2, cols, rows)
+  let kv1 = stemMakePaneView(m1, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 520 - pad * 2, cols, rows)
+  let kv2 = stemMakePaneView(m2, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 520 - pad * 2, cols, rows)
+  let kv3 = stemMakePaneView(m3, 320 + pad, 28 + pad, width - 320 - pad * 2, height - 520 - pad * 2, cols, rows)
   let pscrolls = cocoaGetAssocKey(app, "stem.pscrolls")
   let pkviews = cocoaGetAssocKey(app, "stem.pkviews")
   let pbacks = cocoaGetAssocKey(app, "stem.pbacks")
@@ -1796,7 +1797,6 @@ just run {
   let i = 0
   while i < 2000000000 {
     cocoaPumpEvents(app)
-    if i - (i / 30) * 30 == 0 { ksPoll() }
     if ksNumber("resetgrid") == 1 {
       ksSet("resetgrid", cocoaNumber(0))
       st0 = gridNew(cocoaNumberVal(cocoaArrayGet(cocoaGetAssocKey(app, "stem.pcols"), 0)), cocoaNumberVal(cocoaArrayGet(cocoaGetAssocKey(app, "stem.prows"), 0)))
@@ -1806,13 +1806,13 @@ just run {
     // touching its views again: AppKit may already have released their native
     // backing objects even though our associated pointers still exist.
     if msg(win, "isVisible") == 0 {
-      fdClose(m0)
-      fdClose(m1)
-      fdClose(m2)
-      fdClose(m3)
+      let activeMasters = cocoaGetAssocKey(app, "stem.pmasters")
+      let closeIndex = 0
+      while closeIndex < cocoaArrayCount(activeMasters) { fdClose(cocoaNumberVal(cocoaArrayGet(activeMasters, closeIndex))) closeIndex += 1 }
       msg_1(app, "terminate:", app)
       exit("0")
     }
+    if i - (i / 30) * 30 == 0 { ksSyncSelection() ksPoll() ksPollHelp() }
     let masters = cocoaGetAssocKey(app, "stem.pmasters")
     let pviews = cocoaGetAssocKey(app, "stem.pviews")
     let pdocs = cocoaGetAssocKey(app, "stem.pdocs")

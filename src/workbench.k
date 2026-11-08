@@ -24,6 +24,7 @@ func ksFindIn(name, paths) {
 func ksFind(index) {
     let name = toolField(index, 2)
     let formula = toolField(index, 3)
+    if startsWith(formula, "cask:") { formula = "" }
     let found = ksFindIn(name, ksSearchPath())
     if found != "" { emit found }
     if formula != "" {
@@ -61,8 +62,9 @@ func ksClicked(table) {
     let rows = okSelection(table)
     if okSelectionCount(rows) > 0 {
         let index = cocoaNumberVal(okArrayGet(ksGet("visible"), okSelectionAt(rows, 0)))
-        if index != ksSelected() { okSetText(ksGet("arguments"), toolField(index, 5)) }
+        let changed = index != ksSelected()
         ksDetails(index)
+        if changed { ksSelectOptions(index) }
     }
     emit 0
 }
@@ -155,8 +157,14 @@ func ksRun(self, command, sender) {
     if index < 0 { emit 0 }
     let path = ksFind(index)
     if path == "" { ksRefresh(0, 0, 0) ksStatus("Tool is unavailable. Install it, then run it when ready.") emit 0 }
-    let arguments = literalArgs(okText(ksGet("arguments")))
+    let arguments = ksCommandArguments()
+    if startsWith(arguments, "!value:") { ksStatus("Enter a value for " + substring(arguments, 7, len(arguments))) emit 0 }
     if arguments == "!error" { ksStatus("Invalid arguments: close quotes and remove control characters.") emit 0 }
+    if toolField(index, 0) == "nmap" && trim(okText(ksGet("target"))) == "" && trim(okText(ksGet("arguments"))) == "" {
+        if !contains(arguments, "'-h'") && !contains(arguments, "'-V'") && !contains(arguments, "'--iflist'") && !contains(arguments, "'-iL'") && !contains(arguments, "'-iR'") && !contains(arguments, "'--resume'") && !contains(arguments, "'--script-help'") && !contains(arguments, "'--script-updatedb'") {
+            ksStatus("Enter a target IP, hostname, website, or CIDR before running Nmap.") emit 0
+        }
+    }
     ksLaunch(shellQuote(path) + arguments, toolField(index, 0))
     emit 0
 }
@@ -167,7 +175,7 @@ func ksInstall(self, command, sender) {
     if formula == "" { ksStatus("This is a macOS built-in; Homebrew installation is unavailable.") emit 0 }
     let brew = ksFindIn("brew", ksSearchPath())
     if brew == "" { ksStatus("Homebrew is required. Use the Homebrew button for installation instructions, then Refresh.") emit 0 }
-    let commandText = shellQuote(brew) + " install --formula " + shellQuote(formula)
+    let commandText = installCommand(brew, formula)
     if ksConfirm("Install " + toolField(index, 0) + "?", commandText + "\n\nHomebrew will download this package and its dependencies. The tool will not run automatically.", "Install") {
         ksLaunch(commandText, "Install " + toolField(index, 0))
     }
@@ -196,7 +204,7 @@ func ksDocs(self, command, sender) {
     if index < 0 { emit 0 }
     let formula = toolField(index, 3)
     if formula == "" { ksStatus("Use the tool's help arguments in the Arguments field, then Run.") emit 0 }
-    shellRun("/usr/bin/open " + shellQuote("https://formulae.brew.sh/formula/" + formula))
+    shellRun("/usr/bin/open " + shellQuote(toolInfoURL(formula)))
     emit 0
 }
 func ksCloseAllowed() {
@@ -243,6 +251,7 @@ func ksBuildWorkbench(win, width, height) {
     ksSet("table", table)
     msg_1(table, "setBackgroundColor:", cocoaRGB(41, 32, 55))
     msg_1(msg(table, "enclosingScrollView"), "setBackgroundColor:", cocoaRGB(41, 32, 55))
+    msg_1(table, "removeTableColumn:", msg_1(table, "tableColumnWithIdentifier:", nsString("c0")))
     okColumn(table, "tool", "Tool", 176)
     okColumn(table, "state", "Status", 78)
     okRowHeight(table, 27)
@@ -263,18 +272,40 @@ func ksBuildWorkbench(win, width, height) {
     msg_1(ksGet("name"), "setFont:", cocoaMonoFont(20))
     ksLabel(win, "description", "", 330, height - 70, width - 350, 22, 10)
     ksLabel(win, "installed", "", 330, height - 94, width - 350, 20, 10)
-    let arguments = okField(win, 330, height - 132, width - 350, 28)
+    let target = okField(win, 330, height - 132, width - 350, 28)
+    okAutoresizing(target, 10)
+    msg_1(target, "setBackgroundColor:", cocoaRGB(41, 32, 55))
+    msg_1(target, "setTextColor:", cocoaRGB(214, 219, 228))
+    ksSet("target", target)
+    okFieldOnChange(target, funcptr(ksOptionsChanged))
+    let arguments = okField(win, 330, height - 170, width - 350, 28)
     okAutoresizing(arguments, 10)
-    okPlaceholder(arguments, "Arguments: quoted words supported; shell operators stay literal")
+    okPlaceholder(arguments, "Advanced arguments (optional): flags, subcommands, or quoted values")
     msg_1(arguments, "setBackgroundColor:", cocoaRGB(41, 32, 55))
     msg_1(arguments, "setTextColor:", cocoaRGB(214, 219, 228))
     ksSet("arguments", arguments)
-    ksButton(win, "run", "Run in STEM", 330, height - 174, 140, funcptr(ksRun))
-    ksButton(win, "install", "Install…", 480, height - 174, 110, funcptr(ksInstall))
-    ksButton(win, "stop", "Stop", 600, height - 174, 90, funcptr(ksStop))
-    ksButton(win, "docs", "Tool info", 700, height - 174, 110, funcptr(ksDocs))
+    okFieldOnChange(arguments, funcptr(ksOptionsChanged))
+    ksButton(win, "run", "Run", 330, height - 212, 140, funcptr(ksRun))
+    ksButton(win, "install", "Install…", 480, height - 212, 110, funcptr(ksInstall))
+    ksButton(win, "stop", "Stop", 600, height - 212, 90, funcptr(ksStop))
+    ksButton(win, "docs", "Tool info", 700, height - 212, 110, funcptr(ksDocs))
     okEnabled(ksGet("stop"), 0)
-    ksLabel(win, "status", "", 330, height - 203, width - 350, 23, 10)
+    ksLabel(win, "optionsLabel", "Option buttons", 330, height - 250, width - 500, 24, 10)
+    let load = ksButton(win, "loadOptions", "Load options", width - 158, height - 250, 138, funcptr(ksLoadOptions))
+    okAutoresizing(load, 9)
+    let scroll = msg_frame(msg(cls("NSScrollView"), "alloc"), "initWithFrame:", 330, height - 418, width - 350, 160)
+    msg_1(scroll, "setHasVerticalScroller:", 1)
+    msg_1(scroll, "setAutohidesScrollers:", 1)
+    msg_1(scroll, "setBackgroundColor:", cocoaRGB(41, 32, 55))
+    msg_1(msg(win, "contentView"), "addSubview:", scroll)
+    okAutoresizing(scroll, 10)
+    ksSet("optionsScroll", scroll)
+    msg(scroll, "release")
+    let preview = ksLabel(win, "preview", "", 330, height - 450, width - 350, 25, 10)
+    okSelectable(preview, 1)
+    okToolTip(preview, "Command preview: checked options, advanced arguments, then targets. Values are quoted literally.")
+    msg_1(preview, "setFont:", cocoaMonoFont(12))
+    ksLabel(win, "status", "", 330, height - 482, width - 350, 25, 10)
     ksLabel(win, "hint", "Run replaces the tool terminal. Use only on systems you own or are authorized to test.", 330, 8, width - 350, 22, 2)
     msg_1(ksGet("run"), "setBezelColor:", cocoaRGB(124, 58, 237))
     msg_1(ksGet("run"), "setContentTintColor:", cocoaRGB(255, 255, 255))
@@ -290,7 +321,7 @@ func ksBuildWorkbench(win, width, height) {
     ksSet("visible", okArray())
     ksRefresh(0, 0, 0)
     ksFilter(search)
-    okSetText(arguments, toolField(0, 5))
+    ksSelectOptions(ksSelected())
     emit 1
 }
 func ksAbout(self, command, sender) {
@@ -299,4 +330,14 @@ func ksAbout(self, command, sender) {
     msg_1(alert, "setInformativeText:", nsString("macOS cybersecurity workbench built with Krypton and Objective-K. Embedded STEM terminal, MIT licensed. No tools run or install at launch."))
     msg_1(alert, "addButtonWithTitle:", nsString("OK"))
     msg(alert, "runModal") msg(alert, "release") emit 0
+}
+
+// Native keyboard selection changes do not send the table's click action.
+func ksSyncSelection() {
+    let table = ksGet("table")
+    let row = msg(table, "selectedRow")
+    if row < 0 || row >= okArrayCount(ksGet("visible")) { emit 0 }
+    let index = cocoaNumberVal(okArrayGet(ksGet("visible"), row))
+    if index != ksSelected() { ksClicked(table) }
+    emit 1
 }

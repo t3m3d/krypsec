@@ -62,3 +62,12 @@ func literalArgs(text) {
     if started == 1 { output = output + " " + shellQuote(word) }
     emit output
 }
+
+func installCommand(brew, formula) {
+    if startsWith(formula, "cask:") { emit shellQuote(brew) + " install --cask " + shellQuote(substring(formula, 5, len(formula))) }
+    emit shellQuote(brew) + " install --formula " + shellQuote(formula)
+}
+func toolInfoURL(formula) {
+    if startsWith(formula, "cask:") { emit "https://formulae.brew.sh/cask/" + substring(formula, 5, len(formula)) }
+    emit "https://formulae.brew.sh/formula/" + formula
+}
